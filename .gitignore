@@ -1,0 +1,7 @@
+*.exe
+*.bak
+*.log
+__pycache__/
+*.pyc
+.vscode/
+.idea/
