@@ -1,42 +1,53 @@
 # Control Resonant Texture Streaming Fix
 
-Fix for blurry, muddy, and degrading textures in **Control Resonant** (Remedy's Northlight Engine with Path Tracing & Neural Rendering).
+Complete reverse-engineered fix for blurry, muddy, and degrading textures in **Control Resonant** (Remedy's Northlight Engine with Path Tracing & Neural Rendering).
 
 ---
 
-## The Problem
+## Root Causes of the Blurry Textures
 
-In *Control Resonant*, running **Path Tracing**, **DLSS Ray Reconstruction**, and **DLSS Frame Generation** together requires substantial VRAM (~6.5 GB to 7.0 GB before game textures are loaded).
+In *Control Resonant*, running **Path Tracing**, **DLSS Ray Reconstruction**, and **DLSS Frame Generation** requires high VRAM bandwidth and capacity. On **6 GB to 8 GB GPUs** (e.g. RTX 2060, 3060, 4050, 4060, 5060 Laptop):
 
-On graphics cards with **6 GB to 8 GB of VRAM** (e.g. RTX 2060, 3060, 4050, 4060, 5060 Laptop):
-1. VRAM headroom quickly exhausts in dense areas (such as the Central Executive or Central Field Office).
-2. Northlight Engine's built-in sparse texture streaming supervisor triggers an emergency defragmentation:
-   ```
-   Texture Streaming: Tile Defrag: Trigger On Over Budget
-   ```
-3. The engine aggressively purges high-resolution texture tiles and permanently locks posters, walls, signs, and character outfits to the lowest level-of-detail (LOD) mipmaps to prevent an out-of-memory crash.
-
----
-
-## Why Nexus Mod 135 Crashes Control Resonant
-
-Many players attempt to use [Nexus Mod 135 (Blurry Textures Fix & RTX Overhaul)](https://www.nexusmods.com/control/mods/135) from the original 2019 *Control*. However, Mod 135 crashes Control Resonant on startup:
-
-* **Missing Module:** Mod 135 uses `iphlpapi.dll` (reg2k's Loose Files Loader v1.0), which looks for `rl_rmdwin10_f.dll` (from the 2019 split architecture) and fails with `FATAL: Could not get rl_rmdwinX_f.dll`. In Resonant, the engine is statically linked directly into `CONTROLResonant.exe`.
-* **Pack2FileSystem:** Resonant upgraded the engine's archive system from `PackFileSystem` (`.epack`) to `Pack2FileSystem` (`data_pack2`), while natively reading loose files from `data/` without third-party loaders.
-* **Shader Pipeline Collision:** Mod 135 injects legacy 2019 DXIL `.obj` shaders. Control Resonant uses modern **Slang** shaders with RenoDX pipeline hooks for Path Tracing. Injecting legacy bytecode results in an immediate `0xc0000005` access violation inside `OnInitPipelineLayout`.
-* **Deprecated XML:** Resonant discontinued reading `data/globaldb/tweakables.xml`.
+1. **Aggressive Tile Heap Purging:**
+   * `Tile Defrag: Trigger On Over Budget` drops all active texture tiles when memory is pressured.
+   * `Tile Defrag: Trigger On Failed Allocation` triggers an emergency defragmentation whenever an allocation spike occurs.
+2. **Dynamic Downscaling Bias (`Fit to pool`):**
+   * The Northlight streaming supervisor features an internal controller called `Fit to pool`.
+   * When memory is under pressure, it ramps up an artificial **Mip Target Bias** up to **`+20.0f`** (at rate `10.0f/s`). A mip bias of +20 forces the engine to display the absolute lowest 16x16 or 32x32 mipmaps for all world assets.
+3. **Constrained Sparse Tile Heap:**
+   * The engine's sparse tile heap reserve default is hardcoded to only **512 MB**, which exhausts almost immediately in modern 1440p/4K scenes with Path Tracing enabled.
+4. **Sub-optimal In-Game Settings:**
+   * Often `renderer.ini` defaults to internal 720p render resolution upscaled to 1440p with `0x` Anisotropic Filtering and Low texture resolution.
 
 ---
 
-## The Solution: Engine Binary Patch
+## What the Patch Fixes
 
-Through reverse engineering of `CONTROLResonant.exe`, the internal Northlight streaming flags were located directly inside the executable's `.text` section:
-
-| Setting | Vanilla Default | Patched | File Offset | Description |
+| Patch | Vanilla Value | Patched Value | Technical Offset | Purpose |
 | :--- | :--- | :--- | :--- | :--- |
-| `Tile Defrag:Trigger On Over Budget` | `01 01` (Enabled) | `00 00` (Disabled) | `0x6BFFD` | Stops the engine from dropping mipmaps when VRAM headroom is tight |
-| `Force max res textures` | `00 00` (Disabled) | `01 01` (Enabled) | `0x2D01FD` | Forces the streaming supervisor to hold maximum resolution mipmaps |
+| **Tile Defrag: Over Budget** | `01 01` (Enabled) | `00 00` (Disabled) | `0x6BFFD` | Prevents dropping texture tiles when over memory budget |
+| **Tile Defrag: Failed Alloc** | `01 01` (Enabled) | `00 00` (Disabled) | `0x6BF7D` | Prevents emergency defrag on allocation spikes |
+| **Force Max Res Textures** | `00 00` (Disabled) | `01 01` (Enabled) | `0x2D01FD` | Instructs the streaming manager to hold maximum mipmaps |
+| **Fit to pool: Bias Limit** | `20.0f` (`00 00 A0 41`) | `0.0f` (`00 00 00 00`) | `0x4DD6AD8` | **Stops the engine from adding +20.0 blur bias to textures** |
+| **Tile Heap: Reserve** | `512 MB` (`00 02 00 00`) | `2048 MB` (`00 08 00 00`) | `0x4923A0F` | **Expands the sparse tile memory budget to 2 GB** |
+
+---
+
+## Recommended In-Game Settings (`renderer.ini`)
+
+Located in `%LOCALAPPDATA%\Remedy\CONTROLResonant\renderer.ini`:
+
+* `"m_eTextureResolution": 2` (High)
+* `"m_eTextureFilteringQuality": 2` (Ultra / 16x Anisotropic Filtering)
+* `"m_iRenderResolutionX": 1707` and `"m_iRenderResolutionY": 960` (DLSS Quality at 1440p output)
+* `"m_bFilmGrain": false`
+* `"m_bDepthOfField": false`
+* `"m_eMotionBlur": 0`
+
+### OptiScaler Texture Enhancements (`OptiScaler.ini`)
+* `AnisotropyOverride = 16`
+* `MipmapBiasOverride = -0.5`
+* `MipmapBiasOverrideAll = true`
 
 ---
 
@@ -44,12 +55,9 @@ Through reverse engineering of `CONTROLResonant.exe`, the internal Northlight st
 
 ### Option 1: PowerShell (Windows)
 
-1. Open PowerShell.
-2. Run the patch script, pointing to your game directory:
-   ```powershell
-   .\patch.ps1 -ExePath "E:\path\to\CONTROLResonant.exe"
-   ```
-   *(A `.bak` backup of your original executable is automatically created before any modification.)*
+```powershell
+.\patch.ps1 -ExePath "E:\path\to\CONTROLResonant.exe"
+```
 
 ### Option 2: Python (Cross-platform)
 
@@ -61,17 +69,11 @@ python patch.py "E:\path\to\CONTROLResonant.exe"
 
 ## How to Revert
 
-To restore your executable to original vanilla defaults:
+```powershell
+.\patch.ps1 -ExePath "E:\path\to\CONTROLResonant.exe" -Revert
+```
 
-* **PowerShell:**
-  ```powershell
-  .\patch.ps1 -ExePath "E:\path\to\CONTROLResonant.exe" -Revert
-  ```
-* **Python:**
-  ```bash
-  python patch.py "E:\path\to\CONTROLResonant.exe" --revert
-  ```
-* Or simply restore `CONTROLResonant.exe.bak`.
+Or restore the automatic backup created at `CONTROLResonant.exe.bak`.
 
 ---
 

@@ -2,8 +2,12 @@
 .SYNOPSIS
     Control Resonant Texture Streaming Fix Patcher (PowerShell)
 .DESCRIPTION
-    Disables aggressive over-budget mipmap purging and forces maximum resolution textures
-    in Remedy's Northlight Engine (Control Resonant).
+    Applies the full 5-point reverse-engineered patch suite to CONTROLResonant.exe:
+    - Disables Tile Defrag on Over Budget
+    - Disables Tile Defrag on Failed Allocation
+    - Enables Force max res textures
+    - Disables Fit to pool bias downscaling (20.0f -> 0.0f)
+    - Expands Tile Heap Reserve from 512 MB to 2048 MB
 #>
 
 [CmdletBinding()]
@@ -49,11 +53,33 @@ if (-not (Test-Path $bak)) {
 
 $bytes = [System.IO.File]::ReadAllBytes($target)
 
-$defragOrig   = [byte[]]@(0x66, 0xC7, 0x05, 0x21, 0xA8, 0xBC, 0x05, 0x01, 0x01)
-$defragPatch  = [byte[]]@(0x66, 0xC7, 0x05, 0x21, 0xA8, 0xBC, 0x05, 0x00, 0x00)
-
-$forceOrig    = [byte[]]@(0x66, 0xC7, 0x05, 0xD9, 0xA8, 0xA5, 0x05, 0x00, 0x00)
-$forcePatch   = [byte[]]@(0x66, 0xC7, 0x05, 0xD9, 0xA8, 0xA5, 0x05, 0x01, 0x01)
+$patches = @(
+    @{
+        Name  = "Tile Defrag: Trigger On Over Budget"
+        Orig  = [byte[]]@(0x66, 0xC7, 0x05, 0x21, 0xA8, 0xBC, 0x05, 0x01, 0x01)
+        Patch = [byte[]]@(0x66, 0xC7, 0x05, 0x21, 0xA8, 0xBC, 0x05, 0x00, 0x00)
+    },
+    @{
+        Name  = "Tile Defrag: Trigger On Failed Allocation"
+        Orig  = [byte[]]@(0x66, 0xC7, 0x05, 0x59, 0xA8, 0xBC, 0x05, 0x01, 0x01)
+        Patch = [byte[]]@(0x66, 0xC7, 0x05, 0x59, 0xA8, 0xBC, 0x05, 0x00, 0x00)
+    },
+    @{
+        Name  = "Force max res textures"
+        Orig  = [byte[]]@(0x66, 0xC7, 0x05, 0xD9, 0xA8, 0xA5, 0x05, 0x00, 0x00)
+        Patch = [byte[]]@(0x66, 0xC7, 0x05, 0xD9, 0xA8, 0xA5, 0x05, 0x01, 0x01)
+    },
+    @{
+        Name  = "Fit to pool: Bias limit (20.0f -> 0.0f)"
+        Orig  = [byte[]]@(0x00, 0x00, 0xA0, 0x41, 0x00, 0x00, 0x20, 0x41, 0x00, 0x00, 0x80, 0x41)
+        Patch = [byte[]]@(0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x20, 0x41, 0x00, 0x00, 0x80, 0x41)
+    },
+    @{
+        Name  = "Tile Heap: Reserve (512 MB -> 2048 MB)"
+        Orig  = [byte[]]@(0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x64, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00)
+        Patch = [byte[]]@(0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x64, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00)
+    }
+)
 
 function Find-Sequence {
     param([byte[]]$Haystack, [byte[]]$Needle)
@@ -72,44 +98,28 @@ function Find-Sequence {
 
 if ($Revert) {
     Write-Host "`nReverting to vanilla defaults..." -ForegroundColor Yellow
-    
-    $idx1 = Find-Sequence -Haystack $bytes -Needle $defragPatch
-    if ($idx1 -ge 0) {
-        [System.Array]::Copy($defragOrig, 0, $bytes, $idx1, $defragOrig.Length)
-        Write-Host "[-] Reverted Tile Defrag at offset 0x$($idx1.ToString('X'))" -ForegroundColor Yellow
+    foreach ($p in $patches) {
+        $idx = Find-Sequence -Haystack $bytes -Needle $p.Patch
+        if ($idx -ge 0) {
+            [System.Array]::Copy($p.Orig, 0, $bytes, $idx, $p.Orig.Length)
+            Write-Host "[-] Reverted $($p.Name) at 0x$($idx.ToString('X'))" -ForegroundColor Yellow
+        }
     }
-
-    $idx2 = Find-Sequence -Haystack $bytes -Needle $forcePatch
-    if ($idx2 -ge 0) {
-        [System.Array]::Copy($forceOrig, 0, $bytes, $idx2, $forceOrig.Length)
-        Write-Host "[-] Reverted Force max res at offset 0x$($idx2.ToString('X'))" -ForegroundColor Yellow
-    }
-
     [System.IO.File]::WriteAllBytes($target, $bytes)
     Write-Host "`nReverted successfully." -ForegroundColor Green
 } else {
-    Write-Host "`nApplying texture streaming fixes..." -ForegroundColor Cyan
-
-    $idx1 = Find-Sequence -Haystack $bytes -Needle $defragOrig
-    if ($idx1 -ge 0) {
-        [System.Array]::Copy($defragPatch, 0, $bytes, $idx1, $defragPatch.Length)
-        Write-Host "[+] Patched Tile Defrag:Trigger On Over Budget -> DISABLED at offset 0x$($idx1.ToString('X'))" -ForegroundColor Green
-    } elseif ((Find-Sequence -Haystack $bytes -Needle $defragPatch) -ge 0) {
-        Write-Host "[*] Tile Defrag:Trigger On Over Budget is already patched (DISABLED)." -ForegroundColor Gray
-    } else {
-        Write-Warning "Could not find Tile Defrag pattern."
+    Write-Host "`nApplying full texture streaming fix suite..." -ForegroundColor Cyan
+    foreach ($p in $patches) {
+        $idx = Find-Sequence -Haystack $bytes -Needle $p.Orig
+        if ($idx -ge 0) {
+            [System.Array]::Copy($p.Patch, 0, $bytes, $idx, $p.Patch.Length)
+            Write-Host "[+] Patched $($p.Name) at 0x$($idx.ToString('X'))" -ForegroundColor Green
+        } elseif ((Find-Sequence -Haystack $bytes -Needle $p.Patch) -ge 0) {
+            Write-Host "[*] $($p.Name) is already patched." -ForegroundColor Gray
+        } else {
+            Write-Warning "Could not find sequence for $($p.Name)"
+        }
     }
-
-    $idx2 = Find-Sequence -Haystack $bytes -Needle $forceOrig
-    if ($idx2 -ge 0) {
-        [System.Array]::Copy($forcePatch, 0, $bytes, $idx2, $forcePatch.Length)
-        Write-Host "[+] Patched Force max res textures -> ENABLED at offset 0x$($idx2.ToString('X'))" -ForegroundColor Green
-    } elseif ((Find-Sequence -Haystack $bytes -Needle $forcePatch) -ge 0) {
-        Write-Host "[*] Force max res textures is already patched (ENABLED)." -ForegroundColor Gray
-    } else {
-        Write-Warning "Could not find Force max res pattern."
-    }
-
     [System.IO.File]::WriteAllBytes($target, $bytes)
-    Write-Host "`nPatch applied successfully! Textures will remain crisp." -ForegroundColor Green
+    Write-Host "`nAll patches applied successfully!" -ForegroundColor Green
 }

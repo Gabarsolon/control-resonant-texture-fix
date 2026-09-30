@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
 """
 Control Resonant Texture Streaming Fix Patcher
-Disables aggressive over-budget mipmap purging and forces maximum resolution textures
-in Remedy's Northlight Engine (Control Resonant).
+Complete reverse-engineered fix for blurry textures in Remedy's Northlight Engine (Control Resonant).
+
+Patches:
+1. Tile Defrag: Trigger On Over Budget -> DISABLED (prevents aggressive mip tile dropping)
+2. Tile Defrag: Trigger On Failed Allocation -> DISABLED (prevents panic defrag on allocation spikes)
+3. Force max res textures -> ENABLED (instructs engine to prioritize maximum resolution mipmaps)
+4. Fit to pool: Bias limit -> 0.0f (eliminates the +20.0 positive mip bias downscaling)
+5. Tile Heap: Reserve -> 2048 MB (expands sparse tile heap from default 512 MB)
 """
 
 import sys
@@ -10,11 +16,33 @@ import os
 import shutil
 import argparse
 
-DEFRAG_ORIGINAL = bytes.fromhex("66 C7 05 21 A8 BC 05 01 01")
-DEFRAG_PATCHED  = bytes.fromhex("66 C7 05 21 A8 BC 05 00 00")
-
-FORCE_RES_ORIGINAL = bytes.fromhex("66 C7 05 D9 A8 A5 05 00 00")
-FORCE_RES_PATCHED  = bytes.fromhex("66 C7 05 D9 A8 A5 05 01 01")
+PATCHES = [
+    {
+        "name": "Tile Defrag: Trigger On Over Budget",
+        "orig": bytes.fromhex("66 C7 05 21 A8 BC 05 01 01"),
+        "patch": bytes.fromhex("66 C7 05 21 A8 BC 05 00 00"),
+    },
+    {
+        "name": "Tile Defrag: Trigger On Failed Allocation",
+        "orig": bytes.fromhex("66 C7 05 59 A8 BC 05 01 01"),
+        "patch": bytes.fromhex("66 C7 05 59 A8 BC 05 00 00"),
+    },
+    {
+        "name": "Force max res textures",
+        "orig": bytes.fromhex("66 C7 05 D9 A8 A5 05 00 00"),
+        "patch": bytes.fromhex("66 C7 05 D9 A8 A5 05 01 01"),
+    },
+    {
+        "name": "Fit to pool: Bias limit (20.0f -> 0.0f)",
+        "orig": bytes.fromhex("00 00 A0 41 00 00 20 41 00 00 80 41"),
+        "patch": bytes.fromhex("00 00 00 00 00 00 20 41 00 00 80 41"),
+    },
+    {
+        "name": "Tile Heap: Reserve (512 MB -> 2048 MB)",
+        "orig": bytes.fromhex("00 02 00 00 00 00 00 00 00 64 00 00 00 02 00 00"),
+        "patch": bytes.fromhex("00 08 00 00 00 00 00 00 00 64 00 00 00 08 00 00"),
+    }
+]
 
 def find_target_exe(specified_path=None):
     if specified_path and os.path.isfile(specified_path):
@@ -43,70 +71,40 @@ def patch_exe(exe_path, revert=False):
     with open(exe_path, "rb") as f:
         data = bytearray(f.read())
         
+    all_ok = True
     if revert:
         print("\nReverting patches to vanilla defaults...")
-        defrag_found = False
-        force_res_found = False
-        
-        idx = data.find(DEFRAG_PATCHED)
-        if idx != -1:
-            data[idx:idx+len(DEFRAG_PATCHED)] = DEFRAG_ORIGINAL
-            print(f"[-] Reverted Tile Defrag to enabled at offset 0x{idx:X}")
-            defrag_found = True
-        elif data.find(DEFRAG_ORIGINAL) != -1:
-            print("[*] Tile Defrag is already in vanilla state.")
-            defrag_found = True
-
-        idx2 = data.find(FORCE_RES_PATCHED)
-        if idx2 != -1:
-            data[idx2:idx2+len(FORCE_RES_PATCHED)] = FORCE_RES_ORIGINAL
-            print(f"[-] Reverted Force max res textures to disabled at offset 0x{idx2:X}")
-            force_res_found = True
-        elif data.find(FORCE_RES_ORIGINAL) != -1:
-            print("[*] Force max res textures is already in vanilla state.")
-            force_res_found = True
-
-        if defrag_found or force_res_found:
+        for p in PATCHES:
+            idx = data.find(p["patch"])
+            if idx != -1:
+                data[idx:idx+len(p["patch"])] = p["orig"]
+                print(f"[-] Reverted {p['name']} at offset 0x{idx:X}")
+            elif data.find(p["orig"]) != -1:
+                print(f"[*] {p['name']} is already in vanilla state.")
+            else:
+                print(f"[!] Could not locate patch signature for {p['name']}.")
+                all_ok = False
+        if all_ok:
             with open(exe_path, "wb") as f:
                 f.write(data)
             print("\nSuccessfully reverted executable to vanilla.")
-        else:
-            print("\nFailed to find patch locations.")
-            
     else:
-        print("\nApplying texture streaming fixes...")
-        defrag_patched = False
-        force_res_patched = False
-        
-        idx = data.find(DEFRAG_ORIGINAL)
-        if idx != -1:
-            data[idx:idx+len(DEFRAG_ORIGINAL)] = DEFRAG_PATCHED
-            print(f"[+] Patched Tile Defrag:Trigger On Over Budget -> DISABLED at offset 0x{idx:X}")
-            defrag_patched = True
-        elif data.find(DEFRAG_PATCHED) != -1:
-            print("[*] Tile Defrag:Trigger On Over Budget is already patched (DISABLED).")
-            defrag_patched = True
-        else:
-            print("[!] Could not locate Tile Defrag pattern.")
-
-        idx2 = data.find(FORCE_RES_ORIGINAL)
-        if idx2 != -1:
-            data[idx2:idx2+len(FORCE_RES_ORIGINAL)] = FORCE_RES_PATCHED
-            print(f"[+] Patched Force max res textures -> ENABLED at offset 0x{idx2:X}")
-            force_res_patched = True
-        elif data.find(FORCE_RES_PATCHED) != -1:
-            print("[*] Force max res textures is already patched (ENABLED).")
-            force_res_patched = True
-        else:
-            print("[!] Could not locate Force max res pattern.")
-
-        if defrag_patched and force_res_patched:
+        print("\nApplying complete texture streaming fix suite...")
+        for p in PATCHES:
+            idx = data.find(p["orig"])
+            if idx != -1:
+                data[idx:idx+len(p["orig"])] = p["patch"]
+                print(f"[+] Patched {p['name']} at offset 0x{idx:X}")
+            elif data.find(p["patch"]) != -1:
+                print(f"[*] {p['name']} is already patched.")
+            else:
+                print(f"[!] Could not locate signature for {p['name']}.")
+                all_ok = False
+        if all_ok:
             with open(exe_path, "wb") as f:
                 f.write(data)
-            print("\nSuccess! CONTROLResonant.exe patched successfully.")
-            print("Textures will no longer drop to low resolution during VRAM spikes.")
-        else:
-            print("\nError: Failed to patch one or more locations.")
+            print("\nSuccess! All 5 texture streaming patches applied cleanly.")
+            print("Sparse tile heap expanded and defragmentation locks removed.")
 
 def main():
     parser = argparse.ArgumentParser(description="Control Resonant Texture Streaming Fix Patcher")
