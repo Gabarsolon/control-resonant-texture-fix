@@ -1,8 +1,13 @@
 @echo off
-rem Builds build\CRStreamingFix.addon64 with the MSVC x64 toolchain (VS 2022 or its Build Tools).
-rem   build.bat                                      build the add-on
-rem   build.bat test                                 also run the offline test (no game needed)
-rem   build.bat test "path\to\CONTROLResonant.exe"   ... and check that the signatures resolve in that exe
+rem Builds the add-on for both games with the MSVC x64 toolchain (VS 2022 or its Build Tools):
+rem   build\CRStreamingFix.addon64    Control Resonant
+rem   build\AW2StreamingFix.addon64   Alan Wake 2
+rem
+rem   build.bat                  build both
+rem   build.bat test             also run the offline tests (no game needed)
+rem   build.bat test "path\to\CONTROLResonant.exe" "path\to\AlanWake2.exe"
+rem                              ... and check that the signatures resolve in those executables
+rem                              (either one or both, in any order)
 setlocal
 cd /d "%~dp0"
 
@@ -15,25 +20,50 @@ if errorlevel 1 (
 )
 
 if not exist build mkdir build
-set INC=/Ithird_party\imgui /Ithird_party\reshade
+set FLAGS=/nologo /MT /EHsc /std:c++17 /W4 /DUNICODE /D_UNICODE /Ithird_party\imgui /Ithird_party\reshade
 
-rc /nologo /fo build\CRStreamingFix.res src\CRStreamingFix.rc || exit /b 1
-cl /nologo /LD /O2 /MT /EHsc /std:c++17 /W4 /wd4100 /DUNICODE /D_UNICODE %INC% src\CRStreamingFix.cpp build\CRStreamingFix.res /Fobuild\ /Febuild\CRStreamingFix.addon64 /link /DLL psapi.lib || exit /b 1
-del build\CRStreamingFix.lib build\CRStreamingFix.exp 2>nul
-echo Built build\CRStreamingFix.addon64
-
+call :addon CRStreamingFix || exit /b 1
+call :addon AW2StreamingFix /DCRSF_GAME_AW2 || exit /b 1
 if /i not "%~1"=="test" exit /b 0
 
-rem The add-on only wakes up inside CONTROLResonant.exe, so the test harness is built under that name.
-if not exist build\lifecycle mkdir build\lifecycle
-cl /nologo /Od /MT /EHsc /std:c++17 /W4 /DUNICODE /D_UNICODE %INC% src\test_lifecycle.cpp /Fobuild\lifecycle\ /Febuild\lifecycle\CONTROLResonant.exe || exit /b 1
-copy /y build\CRStreamingFix.addon64 build\lifecycle\ >nul
-build\lifecycle\CONTROLResonant.exe || exit /b 1
+rem The add-on only wakes up inside the game's executable, so each test harness is built under that name.
+call :lifecycle CRStreamingFix CONTROLResonant.exe || exit /b 1
+call :lifecycle AW2StreamingFix AlanWake2.exe /DCRSF_GAME_AW2 || exit /b 1
 
-if "%~2"=="" exit /b 0
-cl /nologo /O2 /MT /EHsc /std:c++17 /DUNICODE /D_UNICODE %INC% src\test_locate.cpp /Fobuild\ /Febuild\test_locate.exe /link psapi.lib || exit /b 1
-build\test_locate.exe "%~2"
-exit /b %errorlevel%
+:next_exe
+shift
+if "%~1"=="" exit /b 0
+if /i "%~nx1"=="CONTROLResonant.exe" (
+    call :locate CRStreamingFix "%~1" || exit /b 1
+) else if /i "%~nx1"=="AlanWake2.exe" (
+    call :locate AW2StreamingFix "%~1" /DCRSF_GAME_AW2 || exit /b 1
+) else (
+    echo "%~1" is neither CONTROLResonant.exe nor AlanWake2.exe.
+    exit /b 1
+)
+goto next_exe
+
+rem :addon <name> [define]
+:addon
+rc /nologo %~2 /fo build\%1.res src\CRStreamingFix.rc || exit /b 1
+cl %FLAGS% %~2 /LD /O2 /wd4100 src\CRStreamingFix.cpp build\%1.res /Fobuild\%1.obj /Febuild\%1.addon64 /link /DLL psapi.lib || exit /b 1
+del build\%1.lib build\%1.exp 2>nul
+echo Built build\%1.addon64
+exit /b 0
+
+rem :lifecycle <name> <game exe> [define]
+:lifecycle
+if not exist build\test-%1 mkdir build\test-%1
+cl %FLAGS% %~3 /Od src\test_lifecycle.cpp /Fobuild\test-%1\ /Febuild\test-%1\%2 || exit /b 1
+copy /y build\%1.addon64 build\test-%1\ >nul
+build\test-%1\%2 || exit /b 1
+exit /b 0
+
+rem :locate <name> <path to the game exe> [define]
+:locate
+cl %FLAGS% %~3 /O2 /wd4100 src\test_locate.cpp /Fobuild\test_locate_%1.obj /Febuild\test_locate_%1.exe /link psapi.lib || exit /b 1
+build\test_locate_%1.exe "%~2" || exit /b 1
+exit /b 0
 
 :find_msvc
 for %%R in ("%ProgramFiles%" "%ProgramFiles(x86)%") do (

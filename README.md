@@ -1,6 +1,13 @@
-# CRStreamingFix
+# Remedy texture fix
 
-A ReShade add-on that stops textures in **Control Resonant** from going blurry a few minutes into play on 6–8 GB graphics cards, with ray tracing or path tracing left on. It changes nothing on disk.
+ReShade add-ons that stop textures in Remedy's Northlight games from going blurry a few minutes into play on 6–8 GB graphics cards, with ray tracing or path tracing left on. They change nothing on disk.
+
+| Game | Add-on | State |
+|---|---|---|
+| Control Resonant | `CRStreamingFix.addon64` | Released. Played on one setup, see [Tested with](#tested-with). |
+| Alan Wake 2 | `AW2StreamingFix.addon64` | Test build. Not run in the game yet, see [Alan Wake 2](#alan-wake-2-test-build). |
+
+Both are built from one source. The rest of this page describes the Control Resonant add-on.
 
 ## The problem
 
@@ -77,6 +84,14 @@ Lowering `BiasLimit` without a bigger pool doesn't sharpen anything, because the
 
 Game 0.563.737.9, ReShade 6.8.0, RTX 5060 Laptop 8 GB, alongside RenoDX and OptiScaler. That is the only setup it has been played on, panel included.
 
+## Alan Wake 2 (test build)
+
+Alan Wake 2 runs the same texture streamer with the same numbers: a 100 MiB floor, ceilings of 1664 MiB, 3 GiB and 4 GiB from Texture Resolution, and the same fit-to-pool controller. `AW2StreamingFix.addon64` is this add-on built for `AlanWake2.exe`.
+
+**It has not been run in the game yet.** It was made from `AlanWake2.exe` 0.559.302.8 alone. The offline test passes and the signatures resolve in that exe, and that is all that has been checked.
+
+Install and settings are as above, with `AW2StreamingFix` in the file names: put `AW2StreamingFix.addon64` next to `AlanWake2.exe`. If you try it, please open an issue with `AW2StreamingFix.log` attached, whether it worked or not.
+
 ## If you used the old patcher from this repo
 
 `patch.py` and `patch.ps1` are gone. They patched the exe based on a misreading of the engine's tweakables. Put back the `CONTROLResonant.exe.bak` they made.
@@ -97,13 +112,23 @@ Addresses are for 0.563.737.9. The add-on finds them by signature.
 
 Four times a second the add-on writes the floor (and the ceiling, if set) into the heap object, and the bias limit into the tweakable's value. When it is unloaded it leaves memory alone.
 
+The same places in Alan Wake 2 0.559.302.8:
+
+| What | Where |
+|---|---|
+| Pool update from `QueryVideoMemoryInfo` | `exe+0x2087D80` |
+| Ceiling from Texture Resolution | `exe+0x2267E6B` |
+| Fit-to-pool controller | `exe+0x22075A0` |
+| `StreamedTextureHeap*` | `exe+0x3A34698`, then `+0x00` pool, `+0x08` min, `+0x10` max |
+| Texture streaming manager | `exe+0x397FEA8`, then `+0x08` demand, `+0x10` bias |
+
 ## Build
 
-`build.bat` needs Visual Studio 2022 or its Build Tools (x64).
+`build.bat` needs Visual Studio 2022 or its Build Tools (x64). Both games come from one source; `src/game.h` holds what differs.
 
-- `build.bat` builds `build\CRStreamingFix.addon64`.
-- `build.bat test` also runs the offline test. It fakes the game and ReShade, menu included, to exercise loading, unloading and every setting.
-- `build.bat test "path\to\CONTROLResonant.exe"` also checks that the signatures resolve in that exe.
+- `build.bat` builds `build\CRStreamingFix.addon64` and `build\AW2StreamingFix.addon64`.
+- `build.bat test` also runs the offline test for both. It fakes the game and ReShade, menu included, to exercise loading, unloading and every setting.
+- `build.bat test "path\to\CONTROLResonant.exe" "path\to\AlanWake2.exe"` also checks that the signatures resolve in those executables. Either one is enough.
 
 The menu panel is drawn through the ImGui function table that ReShade gives add-ons, so no ImGui code is compiled in. The two headers that takes are in `third_party`.
 
