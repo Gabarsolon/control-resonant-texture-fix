@@ -1,0 +1,740 @@
+// CRStreamingFix - texture streaming pool fix for Control Resonant (Northlight, DX12).
+//
+// Why textures go blurry (from disassembly of CONTROLResonant.exe 0.563.737.9):
+//   * The texture streamer (StreamedTextureHeap) sizes its pool as
+//       pool = clamp(DXGI Budget - (process VRAM usage - streamer's own memory), min, max)
+//     with min = 100 MiB (hard-coded) and max = 1664 / 3072 / 4096 MiB from the
+//     Texture Resolution setting. Every MB used by anything else in the process
+//     (path tracing, RR, frame generation, injected mods) comes out of the pool.
+//   * "Texture Streaming:Fit to pool" then raises a global mip bias by 0.1 per update
+//     while texture demand is above 95% of the pool (up to 10 mips), and only lowers it
+//     again once demand drops under 90%. On 6-8 GB cards the pool stays small, so the
+//     bias climbs over a few minutes and never recovers.
+//
+// This add-on raises the pool floor at runtime (and optionally the ceiling and the bias
+// limit). Nothing on disk is patched. Addresses are found by signature, and the add-on
+// does nothing if a signature does not match.
+
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#include <psapi.h>
+#include <algorithm>
+#include <cstdarg>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <cwchar>
+#include <string>
+#include <vector>
+
+#define CRSF_VERSION "1.0.0"
+
+extern "C" __declspec(dllexport) const char *NAME = "CRStreamingFix";
+extern "C" __declspec(dllexport) const char *DESCRIPTION =
+    "Keeps Control Resonant's texture streaming pool from shrinking to mush on low-VRAM GPUs. "
+    "Settings: CRStreamingFix.ini";
+
+namespace
+{
+constexpr uint32_t kReShadeApiVersion = 18; // ReShade 6.8; older ReShade is offered lower versions
+constexpr uint64_t kMiB = 1024ull * 1024ull;
+constexpr DWORD kFirstTickMs = 1000; // ReShade loads and drops add-ons a few times at startup; skip those
+constexpr DWORD kTickMs = 250;
+
+HMODULE g_module = nullptr;
+uintptr_t g_exe_base = 0;
+std::wstring g_dir; // folder of this DLL, with trailing backslash
+HANDLE g_log = INVALID_HANDLE_VALUE;
+HANDLE g_timer = nullptr;
+volatile LONG g_busy = 0;
+bool g_registered_with_reshade = false;
+
+struct Config
+{
+    uint64_t min_pool_mb = 2048;
+    uint64_t max_pool_mb = 0;  // 0 = leave the game's value
+    float bias_limit = -1.0f;  // < 0 = leave the game's value
+    uint32_t log_interval_s = 5;
+};
+
+struct Targets
+{
+    uintptr_t heap_ptr = 0;       // global: StreamedTextureHeap*
+    uintptr_t mgr_ptr = 0;        // global: TextureStreamingManager*
+    uintptr_t bias_limit = 0;     // float tweakable value "Fit to pool:Bias limit"
+    uintptr_t high_threshold = 0; // float "Fit to pool:High memory threshold"
+    uintptr_t low_threshold = 0;  // float "Fit to pool:Low memory threshold"
+    uintptr_t bias_rate = 0;      // float "Fit to pool:Rate of bias change"
+};
+
+// The game's own values, read before the first write. Kept in a process environment variable
+// too, so they survive ReShade unloading and reloading the add-on within one run.
+struct Baseline
+{
+    bool valid = false;
+    uint64_t game_min = 0;
+    uint64_t game_max = 0; // follows the Texture Resolution setting
+    uint64_t our_max = 0;  // last max we wrote (0 = none), to tell our writes from the game's
+    float game_bias_limit = 10.0f;
+};
+
+struct State
+{
+    bool started = false;
+    bool located = false;
+    bool announce = true; // log the limits at the next apply
+    Targets targets;
+    Config cfg;
+    FILETIME cfg_time = {};
+    Baseline base;
+    ULONGLONG last_stats = 0;
+};
+State g_state;
+
+// ---------------------------------------------------------------------------------------
+// logging
+
+void log_line(const char *fmt, ...)
+{
+    if (g_log == INVALID_HANDLE_VALUE)
+        return;
+    char buf[1024];
+    SYSTEMTIME t;
+    GetLocalTime(&t);
+    int n = std::snprintf(buf, sizeof(buf), "%02u:%02u:%02u.%03u ", t.wHour, t.wMinute, t.wSecond, t.wMilliseconds);
+    va_list args;
+    va_start(args, fmt);
+    n += std::vsnprintf(buf + n, sizeof(buf) - n - 2, fmt, args);
+    va_end(args);
+    if (n > static_cast<int>(sizeof(buf)) - 3)
+        n = static_cast<int>(sizeof(buf)) - 3;
+    buf[n++] = '\r';
+    buf[n++] = '\n';
+    DWORD written;
+    WriteFile(g_log, buf, n, &written, nullptr);
+}
+
+void open_log()
+{
+    // Start a fresh log per game run, but keep appending if the add-on is reloaded within the run.
+    wchar_t marker[2];
+    const bool first_load = GetEnvironmentVariableW(L"CRSTREAMINGFIX_LOG", marker, 2) == 0;
+    const std::wstring path = g_dir + L"CRStreamingFix.log";
+    g_log = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                        first_load ? CREATE_ALWAYS : OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (g_log == INVALID_HANDLE_VALUE)
+        return;
+    SetFilePointer(g_log, 0, nullptr, FILE_END);
+    SetEnvironmentVariableW(L"CRSTREAMINGFIX_LOG", L"1");
+}
+
+// ---------------------------------------------------------------------------------------
+// guarded memory access (game objects can be freed during shutdown)
+
+bool read_u64(uintptr_t addr, uint64_t &out)
+{
+    __try
+    {
+        out = *reinterpret_cast<volatile uint64_t *>(addr);
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+}
+
+bool read_f32(uintptr_t addr, float &out)
+{
+    __try
+    {
+        out = *reinterpret_cast<volatile float *>(addr);
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+}
+
+bool write_u64(uintptr_t addr, uint64_t value)
+{
+    __try
+    {
+        *reinterpret_cast<volatile uint64_t *>(addr) = value;
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+}
+
+bool write_f32(uintptr_t addr, float value)
+{
+    __try
+    {
+        *reinterpret_cast<volatile float *>(addr) = value;
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// signature scanning
+
+struct Section
+{
+    uintptr_t begin = 0, end = 0;
+};
+
+bool find_section(uintptr_t base, const char *name, Section &out)
+{
+    const auto *dos = reinterpret_cast<const IMAGE_DOS_HEADER *>(base);
+    const auto *nt = reinterpret_cast<const IMAGE_NT_HEADERS64 *>(base + dos->e_lfanew);
+    const IMAGE_SECTION_HEADER *sec = IMAGE_FIRST_SECTION(nt);
+    for (unsigned i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++sec)
+    {
+        if (std::strncmp(reinterpret_cast<const char *>(sec->Name), name, 8) == 0)
+        {
+            out.begin = base + sec->VirtualAddress;
+            out.end = out.begin + std::max(sec->Misc.VirtualSize, sec->SizeOfRawData);
+            return true;
+        }
+    }
+    return false;
+}
+
+// "48 8B ?? C3" style pattern
+std::vector<int> parse_pattern(const char *pattern)
+{
+    std::vector<int> bytes;
+    for (const char *p = pattern; *p;)
+    {
+        if (*p == ' ')
+        {
+            ++p;
+            continue;
+        }
+        if (*p == '?')
+        {
+            bytes.push_back(-1);
+            while (*p == '?')
+                ++p;
+            continue;
+        }
+        bytes.push_back(static_cast<int>(std::strtoul(p, const_cast<char **>(&p), 16)));
+    }
+    return bytes;
+}
+
+std::vector<uintptr_t> scan(const Section &s, const char *pattern, size_t max_hits = 16)
+{
+    const std::vector<int> pat = parse_pattern(pattern);
+    std::vector<uintptr_t> hits;
+    const auto *mem = reinterpret_cast<const uint8_t *>(s.begin);
+    const size_t size = s.end - s.begin;
+    if (pat.empty() || size < pat.size())
+        return hits;
+    for (size_t i = 0; i + pat.size() <= size; ++i)
+    {
+        if (pat[0] >= 0 && mem[i] != pat[0])
+            continue;
+        size_t j = 1;
+        for (; j < pat.size(); ++j)
+            if (pat[j] >= 0 && mem[i + j] != pat[j])
+                break;
+        if (j == pat.size())
+        {
+            hits.push_back(s.begin + i);
+            if (hits.size() >= max_hits)
+                break;
+        }
+    }
+    return hits;
+}
+
+uintptr_t rel32_target(uintptr_t disp_addr)
+{
+    const int32_t disp = *reinterpret_cast<const int32_t *>(disp_addr);
+    return disp_addr + 4 + disp;
+}
+
+bool bytes_match(uintptr_t addr, const char *pattern)
+{
+    const std::vector<int> pat = parse_pattern(pattern);
+    const auto *mem = reinterpret_cast<const uint8_t *>(addr);
+    for (size_t i = 0; i < pat.size(); ++i)
+        if (pat[i] >= 0 && mem[i] != pat[i])
+            return false;
+    return true;
+}
+
+bool in_section(uintptr_t addr, const Section &s)
+{
+    return addr >= s.begin && addr < s.end;
+}
+
+bool locate(uintptr_t base, Targets &t)
+{
+    Section text, data;
+    if (!find_section(base, ".text", text) || !find_section(base, ".data", data))
+    {
+        log_line("ERROR: could not read the section table of the game executable");
+        return false;
+    }
+
+    // Fit-to-pool controller. Starts with:
+    //   call StreamedTextureHeap::get ; mov rcx,rax ; call StreamedTextureHeap::poolSize
+    const auto fit = scan(text,
+                          "48 8B C4 48 89 58 20 55 56 57 41 56 41 57 48 81 EC C0 00 00 00 C5 F8 29 70 C8 "
+                          "C5 F8 29 78 B8 4C 8B F1 E8 ?? ?? ?? ?? 48 8B C8 E8 ?? ?? ?? ?? 48 8B C8 C5 F0 57 C9");
+    if (fit.size() != 1)
+    {
+        log_line("ERROR: fit-to-pool signature matched %zu times (expected 1). Unsupported game version, doing nothing.",
+                 fit.size());
+        return false;
+    }
+    const uintptr_t f = fit[0];
+    const uintptr_t heap_getter = rel32_target(f + 35);
+    const uintptr_t pool_getter = rel32_target(f + 43);
+    if (!in_section(heap_getter, text) || !in_section(pool_getter, text) ||
+        !bytes_match(heap_getter, "48 8B 05 ?? ?? ?? ?? C3") || !bytes_match(pool_getter, "48 8B 01 C3"))
+    {
+        log_line("ERROR: StreamedTextureHeap accessors look different than expected, doing nothing.");
+        return false;
+    }
+    t.heap_ptr = rel32_target(heap_getter + 3);
+
+    // vsubss xmm0,xmm4,[High] / [Low] ; vsubss xmm0,xmm7,[Rate] ; vminss xmm6,xmm6,[Bias limit]
+    if (!bytes_match(f + 0x5C, "C5 DA 5C 05") || !bytes_match(f + 0x97, "C5 DA 5C 05") ||
+        !bytes_match(f + 0xD2, "C5 C2 5C 05") || !bytes_match(f + 0xF9, "C5 CA 5D 35"))
+    {
+        log_line("ERROR: fit-to-pool body looks different than expected, doing nothing.");
+        return false;
+    }
+    t.high_threshold = rel32_target(f + 0x5C + 4);
+    t.low_threshold = rel32_target(f + 0x97 + 4);
+    t.bias_rate = rel32_target(f + 0xD2 + 4);
+    t.bias_limit = rel32_target(f + 0xF9 + 4);
+
+    // Texture streaming manager: stats code does
+    //   call getManager (mov rax,[rip+x]; ret) ; mov rcx,rax ; call getBias (vmovss xmm0,[rcx+8]; ret)
+    for (uintptr_t hit : scan(text, "E8 ?? ?? ?? ?? 48 8B C8 E8 ?? ?? ?? ?? C5 F8 28 C8"))
+    {
+        const uintptr_t get_mgr = rel32_target(hit + 1);
+        const uintptr_t get_bias = rel32_target(hit + 9);
+        if (in_section(get_mgr, text) && in_section(get_bias, text) && bytes_match(get_mgr, "48 8B 05 ?? ?? ?? ?? C3") &&
+            bytes_match(get_bias, "C5 FA 10 41 08 C3"))
+        {
+            t.mgr_ptr = rel32_target(get_mgr + 3);
+            break;
+        }
+    }
+
+    const uintptr_t all[] = {t.heap_ptr, t.high_threshold, t.low_threshold, t.bias_rate, t.bias_limit};
+    for (uintptr_t a : all)
+    {
+        if (!in_section(a, data))
+        {
+            log_line("ERROR: resolved address %p is outside .data, doing nothing.", reinterpret_cast<void *>(a));
+            return false;
+        }
+    }
+    if (t.mgr_ptr && !in_section(t.mgr_ptr, data))
+        t.mgr_ptr = 0;
+
+    log_line("Found fit-to-pool at exe+0x%llX, heap ptr exe+0x%llX, manager ptr %s",
+             static_cast<unsigned long long>(f - base), static_cast<unsigned long long>(t.heap_ptr - base),
+             t.mgr_ptr ? "found" : "not found (stats will lack bias/demand)");
+    return true;
+}
+
+// ---------------------------------------------------------------------------------------
+// config
+
+std::wstring ini_path()
+{
+    return g_dir + L"CRStreamingFix.ini";
+}
+
+void write_default_ini()
+{
+    const std::wstring path = ini_path();
+    if (GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES)
+        return;
+    static const char text[] =
+        "; CRStreamingFix settings. Edits are picked up while the game runs.\r\n"
+        "[CRStreamingFix]\r\n"
+        "; Smallest texture streaming pool in MB. The game allows 100 MB and shrinks the pool to whatever\r\n"
+        "; VRAM is left after everything else, which is what makes textures blurry on 6-8 GB cards.\r\n"
+        "; Higher = sharper, but past your free VRAM Windows starts paging to system RAM (stutter).\r\n"
+        "; 0 = leave the game's value.\r\n"
+        "MinPoolMB=2048\r\n"
+        "; Largest pool in MB. The game sets 1664 / 3072 / 4096 from Texture Resolution Low / Medium / High.\r\n"
+        "; 0 = leave the game's value.\r\n"
+        "MaxPoolMB=0\r\n"
+        "; Largest mip bias the streamer may add when textures don't fit the pool (game default 10).\r\n"
+        "; -1 = leave the game's value.\r\n"
+        "BiasLimit=-1\r\n"
+        "; Seconds between stats lines in CRStreamingFix.log. 0 = off.\r\n"
+        "LogIntervalSec=5\r\n";
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE)
+        return;
+    DWORD written;
+    WriteFile(h, text, sizeof(text) - 1, &written, nullptr);
+    CloseHandle(h);
+}
+
+Config read_config()
+{
+    const std::wstring path = ini_path();
+    Config c;
+    c.min_pool_mb = GetPrivateProfileIntW(L"CRStreamingFix", L"MinPoolMB", 2048, path.c_str());
+    c.max_pool_mb = GetPrivateProfileIntW(L"CRStreamingFix", L"MaxPoolMB", 0, path.c_str());
+    c.log_interval_s = GetPrivateProfileIntW(L"CRStreamingFix", L"LogIntervalSec", 5, path.c_str());
+    wchar_t buf[64] = {};
+    GetPrivateProfileStringW(L"CRStreamingFix", L"BiasLimit", L"-1", buf, 64, path.c_str());
+    c.bias_limit = static_cast<float>(std::wcstod(buf, nullptr));
+    if (c.min_pool_mb > 16384)
+        c.min_pool_mb = 16384;
+    if (c.max_pool_mb > 16384)
+        c.max_pool_mb = 16384;
+    if (c.bias_limit > 20.0f)
+        c.bias_limit = 20.0f;
+    return c;
+}
+
+FILETIME ini_time()
+{
+    WIN32_FILE_ATTRIBUTE_DATA d = {};
+    GetFileAttributesExW(ini_path().c_str(), GetFileExInfoStandard, &d);
+    return d.ftLastWriteTime;
+}
+
+void log_config(const char *what, const Config &c)
+{
+    log_line("%s: MinPoolMB=%llu MaxPoolMB=%llu BiasLimit=%.2f LogIntervalSec=%u", what,
+             static_cast<unsigned long long>(c.min_pool_mb), static_cast<unsigned long long>(c.max_pool_mb),
+             c.bias_limit, c.log_interval_s);
+}
+
+// ---------------------------------------------------------------------------------------
+// baseline (the game's own values)
+
+void save_baseline(const Baseline &b)
+{
+    wchar_t buf[128];
+    std::swprintf(buf, 128, L"%llu %llu %llu %.9g", static_cast<unsigned long long>(b.game_min),
+                  static_cast<unsigned long long>(b.game_max), static_cast<unsigned long long>(b.our_max),
+                  static_cast<double>(b.game_bias_limit));
+    SetEnvironmentVariableW(L"CRSTREAMINGFIX_BASELINE", buf);
+}
+
+bool load_baseline(Baseline &b)
+{
+    wchar_t buf[128] = {};
+    if (GetEnvironmentVariableW(L"CRSTREAMINGFIX_BASELINE", buf, 128) == 0)
+        return false;
+    unsigned long long mn = 0, mx = 0, our = 0;
+    double bias = 0;
+    if (swscanf_s(buf, L"%llu %llu %llu %lf", &mn, &mx, &our, &bias) != 4)
+        return false;
+    b.game_min = mn;
+    b.game_max = mx;
+    b.our_max = our;
+    b.game_bias_limit = static_cast<float>(bias);
+    b.valid = true;
+    return true;
+}
+
+// ---------------------------------------------------------------------------------------
+// the fix
+
+void apply(State &s)
+{
+    const Targets &t = s.targets;
+    const Config &c = s.cfg;
+    Baseline &b = s.base;
+
+    uint64_t heap = 0;
+    if (!read_u64(t.heap_ptr, heap) || heap == 0)
+        return; // renderer not created yet
+
+    uint64_t pool = 0, min_pool = 0, max_pool = 0;
+    float bias_limit = 0;
+    if (!read_u64(heap + 0x00, pool) || !read_u64(heap + 0x08, min_pool) || !read_u64(heap + 0x10, max_pool) ||
+        !read_f32(t.bias_limit, bias_limit))
+        return;
+
+    if (!b.valid && !load_baseline(b))
+    {
+        // The renderer exists, so the tweakables were initialised long ago and nothing here is ours yet.
+        b.game_min = min_pool;
+        b.game_max = max_pool;
+        b.our_max = 0;
+        b.game_bias_limit = bias_limit;
+        b.valid = true;
+        save_baseline(b);
+        float hi = 0, lo = 0, rate = 0;
+        read_f32(t.high_threshold, hi);
+        read_f32(t.low_threshold, lo);
+        read_f32(t.bias_rate, rate);
+        log_line("Game values: pool min %llu MB, max %llu MB; fit-to-pool bias limit %.2f, +/-%.2f per update, "
+                 "raise above %.0f%% of pool, lower below %.0f%%",
+                 static_cast<unsigned long long>(b.game_min / kMiB), static_cast<unsigned long long>(b.game_max / kMiB),
+                 b.game_bias_limit, rate, (1.0f - lo) * 100.0f, (1.0f - hi) * 100.0f);
+    }
+    else if (max_pool != b.our_max && max_pool != b.game_max)
+    {
+        b.game_max = max_pool; // the game set a new ceiling (Texture Resolution changed)
+        save_baseline(b);
+        s.announce = true;
+    }
+
+    const uint64_t want_min = c.min_pool_mb ? c.min_pool_mb * kMiB : b.game_min;
+    uint64_t want_max = c.max_pool_mb ? c.max_pool_mb * kMiB : b.game_max;
+    if (want_min > want_max)
+        want_max = want_min; // e.g. Texture Resolution Low caps the pool at 1664 MB
+
+    if (max_pool != want_max && write_u64(heap + 0x10, want_max))
+    {
+        b.our_max = want_max != b.game_max ? want_max : 0;
+        save_baseline(b);
+        s.announce = true;
+    }
+    if (min_pool != want_min && write_u64(heap + 0x08, want_min))
+        s.announce = true;
+    if (pool < want_min)
+        write_u64(heap + 0x00, want_min); // take effect now instead of at the game's next pool update
+
+    const float want_bias = c.bias_limit >= 0.0f ? c.bias_limit : b.game_bias_limit;
+    if (bias_limit != want_bias && write_f32(t.bias_limit, want_bias))
+        s.announce = true;
+
+    if (s.announce)
+    {
+        s.announce = false;
+        log_line("Applied: pool min %llu MB (game %llu), max %llu MB (game %llu), bias limit %.2f (game %.2f)",
+                 static_cast<unsigned long long>(want_min / kMiB), static_cast<unsigned long long>(b.game_min / kMiB),
+                 static_cast<unsigned long long>(want_max / kMiB), static_cast<unsigned long long>(b.game_max / kMiB),
+                 want_bias, b.game_bias_limit);
+    }
+}
+
+void log_stats(const Targets &t)
+{
+    uint64_t heap = 0, pool = 0, min_pool = 0, max_pool = 0, st = 0, heap_bytes = 0, tiles = 0, left_lo = 0,
+             left_hi = 0;
+    if (!read_u64(t.heap_ptr, heap) || heap == 0)
+    {
+        log_line("waiting for the renderer...");
+        return;
+    }
+    read_u64(heap + 0x00, pool);
+    read_u64(heap + 0x08, min_pool);
+    read_u64(heap + 0x10, max_pool);
+    read_u64(heap + 0x18, st);
+    if (st)
+    {
+        read_u64(st + 0x1E0, heap_bytes);
+        read_u64(st + 0x140, tiles);
+        read_u64(st + 0x1A8, left_lo);
+        read_u64(st + 0x1B0, left_hi);
+    }
+    const uint64_t used = heap_bytes + (tiles << 16);
+
+    uint64_t mgr = 0, demand = 0;
+    float bias = 0.0f;
+    if (t.mgr_ptr && read_u64(t.mgr_ptr, mgr) && mgr)
+    {
+        read_u64(mgr + 0x00, demand);
+        read_f32(mgr + 0x08, bias);
+    }
+
+    // "left" is what the game computes as free for textures (DXGI budget minus the rest of the process),
+    // as a low-high range over its sampling window. It is the pool the game would pick by itself.
+    // Until the game has sampled once, the two fields hold 0 and ~0.
+    char left[96];
+    if (left_lo > left_hi || left_hi > (1ull << 50))
+        std::snprintf(left, sizeof(left), "n/a");
+    else if (pool > left_lo)
+        std::snprintf(left, sizeof(left), "%llu-%llu MB (pool is %llu MB above it)",
+                      static_cast<unsigned long long>(left_lo / kMiB), static_cast<unsigned long long>(left_hi / kMiB),
+                      static_cast<unsigned long long>((pool - left_lo) / kMiB));
+    else
+        std::snprintf(left, sizeof(left), "%llu-%llu MB", static_cast<unsigned long long>(left_lo / kMiB),
+                      static_cast<unsigned long long>(left_hi / kMiB));
+
+    log_line("pool %4llu MB [min %llu, max %llu] | used %4llu MB | demand %4llu MB | bias %.2f mips | "
+             "VRAM left for textures %s",
+             static_cast<unsigned long long>(pool / kMiB), static_cast<unsigned long long>(min_pool / kMiB),
+             static_cast<unsigned long long>(max_pool / kMiB), static_cast<unsigned long long>(used / kMiB),
+             static_cast<unsigned long long>(demand / kMiB), bias, left);
+}
+
+// Runs on a thread pool thread every kTickMs. Must not take the loader lock: DllMain waits for it on unload.
+VOID CALLBACK tick(PVOID, BOOLEAN)
+{
+    if (InterlockedCompareExchange(&g_busy, 1, 0) != 0)
+        return; // previous tick still running (first one scans the executable)
+
+    State &s = g_state;
+    if (!s.started)
+    {
+        s.started = true;
+        open_log();
+        log_line("CRStreamingFix " CRSF_VERSION " (%s)",
+                 g_registered_with_reshade ? "ReShade add-on" : "loaded without ReShade");
+        s.located = locate(g_exe_base, s.targets);
+        if (s.located)
+        {
+            write_default_ini();
+            s.cfg = read_config();
+            s.cfg_time = ini_time();
+            log_config("Config", s.cfg);
+        }
+    }
+
+    if (s.located)
+    {
+        const FILETIME now_time = ini_time();
+        if (CompareFileTime(&now_time, &s.cfg_time) != 0)
+        {
+            s.cfg_time = now_time;
+            s.cfg = read_config();
+            s.announce = true;
+            log_config("Config reloaded", s.cfg);
+        }
+
+        apply(s);
+
+        const ULONGLONG now = GetTickCount64();
+        if (s.cfg.log_interval_s && now - s.last_stats >= s.cfg.log_interval_s * 1000ull)
+        {
+            s.last_stats = now;
+            log_stats(s.targets);
+        }
+    }
+
+    InterlockedExchange(&g_busy, 0);
+}
+
+// ---------------------------------------------------------------------------------------
+// loading
+
+// ReShade add-on registration without the SDK: find the module that exports ReShadeRegisterAddon.
+HMODULE find_reshade()
+{
+    HMODULE modules[1024];
+    DWORD needed = 0;
+    if (!EnumProcessModules(GetCurrentProcess(), modules, sizeof(modules), &needed))
+        return nullptr;
+    const DWORD count = std::min<DWORD>(needed / sizeof(HMODULE), 1024);
+    for (DWORD i = 0; i < count; ++i)
+        if (GetProcAddress(modules[i], "ReShadeRegisterAddon") && GetProcAddress(modules[i], "ReShadeUnregisterAddon"))
+            return modules[i];
+    return nullptr;
+}
+
+bool has_addon_extension(const wchar_t *path)
+{
+    const wchar_t *ext = std::wcsrchr(path, L'.');
+    return ext && (_wcsicmp(ext, L".addon64") == 0 || _wcsicmp(ext, L".addon") == 0);
+}
+
+bool process_is_exiting()
+{
+    using fn = BOOLEAN(NTAPI *)();
+    if (HMODULE ntdll = GetModuleHandleW(L"ntdll.dll"))
+        if (const auto in_progress = reinterpret_cast<fn>(GetProcAddress(ntdll, "RtlDllShutdownInProgress")))
+            return in_progress() != FALSE;
+    return false;
+}
+
+void stop_timer()
+{
+    if (!g_timer)
+        return;
+    // Wait for a running tick to finish before the DLL goes away. Ticks never need the loader lock.
+    HANDLE done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (done)
+    {
+        if (DeleteTimerQueueTimer(nullptr, g_timer, done) || GetLastError() == ERROR_IO_PENDING)
+            WaitForSingleObject(done, 5000);
+        CloseHandle(done);
+    }
+    else
+    {
+        DeleteTimerQueueTimer(nullptr, g_timer, INVALID_HANDLE_VALUE);
+    }
+    g_timer = nullptr;
+}
+} // namespace
+
+BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved)
+{
+    if (reason == DLL_PROCESS_ATTACH)
+    {
+        g_module = module;
+
+        wchar_t path[MAX_PATH] = {};
+        GetModuleFileNameW(nullptr, path, MAX_PATH);
+        const wchar_t *exe_name = std::wcsrchr(path, L'\\');
+        exe_name = exe_name ? exe_name + 1 : path;
+        if (_wcsicmp(exe_name, L"CONTROLResonant.exe") != 0)
+            return TRUE; // some other process (another game, a setup tool): stay inert
+        g_exe_base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+
+        GetModuleFileNameW(module, path, MAX_PATH);
+        g_dir = path;
+        g_dir.resize(g_dir.find_last_of(L'\\') + 1);
+
+        if (has_addon_extension(path))
+        {
+            if (HMODULE reshade = find_reshade())
+            {
+                using register_fn = bool(__cdecl *)(HMODULE, uint32_t);
+                const auto reg = reinterpret_cast<register_fn>(GetProcAddress(reshade, "ReShadeRegisterAddon"));
+                for (uint32_t version = kReShadeApiVersion; version >= 1 && !g_registered_with_reshade; --version)
+                    g_registered_with_reshade = reg(module, version);
+                if (!g_registered_with_reshade)
+                    return FALSE; // ReShade refused the add-on and would unload it anyway
+            }
+        }
+
+        if (!CreateTimerQueueTimer(&g_timer, nullptr, tick, nullptr, kFirstTickMs, kTickMs, WT_EXECUTEDEFAULT))
+            g_timer = nullptr;
+    }
+    else if (reason == DLL_PROCESS_DETACH)
+    {
+        // At process exit the other threads are already gone; there is nothing to wait for or hand back.
+        if (reserved != nullptr || process_is_exiting())
+            return TRUE;
+
+        stop_timer();
+        if (g_registered_with_reshade)
+        {
+            if (HMODULE reshade = find_reshade())
+            {
+                using unregister_fn = void(__cdecl *)(HMODULE);
+                if (const auto unreg = reinterpret_cast<unregister_fn>(GetProcAddress(reshade, "ReShadeUnregisterAddon")))
+                    unreg(module);
+            }
+            g_registered_with_reshade = false;
+        }
+        if (g_log != INVALID_HANDLE_VALUE)
+        {
+            log_line("Unloaded.");
+            CloseHandle(g_log);
+            g_log = INVALID_HANDLE_VALUE;
+        }
+    }
+    return TRUE;
+}

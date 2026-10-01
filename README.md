@@ -1,82 +1,100 @@
-# Control Resonant Texture Streaming Fix
+# CRStreamingFix
 
-Complete reverse-engineered fix for blurry, muddy, and degrading textures in **Control Resonant** (Remedy's Northlight Engine with Path Tracing & Neural Rendering).
+A ReShade add-on that stops textures in **Control Resonant** from going blurry a few minutes into play on 6–8 GB graphics cards, with ray tracing or path tracing left on. It changes nothing on disk.
 
----
+## The problem
 
-## Root Causes of the Blurry Textures
+Textures look fine when you load in, then turn to mush and stay that way. Changing Texture Resolution doesn't help. Turning off ray tracing or dropping the resolution does.
 
-In *Control Resonant*, running **Path Tracing**, **DLSS Ray Reconstruction**, and **DLSS Frame Generation** requires high VRAM bandwidth and capacity. On **6 GB to 8 GB GPUs** (e.g. RTX 2060, 3060, 4050, 4060, 5060 Laptop):
+The cause, from disassembling `CONTROLResonant.exe` 0.563.737.9:
 
-1. **Aggressive Tile Heap Purging:**
-   * `Tile Defrag: Trigger On Over Budget` drops all active texture tiles when memory is pressured.
-   * `Tile Defrag: Trigger On Failed Allocation` triggers an emergency defragmentation whenever an allocation spike occurs.
-2. **Dynamic Downscaling Bias (`Fit to pool`):**
-   * The Northlight streaming supervisor features an internal controller called `Fit to pool`.
-   * When memory is under pressure, it ramps up an artificial **Mip Target Bias** up to **`+20.0f`** (at rate `10.0f/s`). A mip bias of +20 forces the engine to display the absolute lowest 16x16 or 32x32 mipmaps for all world assets.
-3. **Constrained Sparse Tile Heap:**
-   * The engine's sparse tile heap reserve default is hardcoded to only **512 MB**, which exhausts almost immediately in modern 1440p/4K scenes with Path Tracing enabled.
-4. **Sub-optimal In-Game Settings:**
-   * Often `renderer.ini` defaults to internal 720p render resolution upscaled to 1440p with `0x` Anisotropic Filtering and Low texture resolution.
+- **Pool size.** The texture streamer sizes its pool as the DXGI budget minus everything else the game process has in VRAM, clamped between 100 MiB and a ceiling. Path tracing, ray reconstruction, frame generation and anything injected into the process all come out of the pool.
+- **Texture Resolution.** It only sets the ceiling: 1664 MiB on Low, 3 GiB on Medium, 4 GiB above that. When your leftover VRAM is below the ceiling, the setting does nothing.
+- **Blur.** While textures need more than 95% of the pool, the engine adds 0.1 mips of blur per update, up to 10. It removes blur only once demand falls under 90%.
 
----
+So on a small card the pool follows your free VRAM down, and the blur follows the pool.
 
-## What the Patch Fixes
+In one test session (8 GB card, 1440p, path tracing, ray reconstruction and frame generation on) the game left a median of 1.1 GB for textures. Within three minutes that was down to 228 MB.
 
-| Patch | Vanilla Value | Patched Value | Technical Offset | Purpose |
-| :--- | :--- | :--- | :--- | :--- |
-| **Tile Defrag: Over Budget** | `01 01` (Enabled) | `00 00` (Disabled) | `0x6BFFD` | Prevents dropping texture tiles when over memory budget |
-| **Tile Defrag: Failed Alloc** | `01 01` (Enabled) | `00 00` (Disabled) | `0x6BF7D` | Prevents emergency defrag on allocation spikes |
-| **Force Max Res Textures** | `00 00` (Disabled) | `01 01` (Enabled) | `0x2D01FD` | Instructs the streaming manager to hold maximum mipmaps |
-| **Fit to pool: Bias Limit** | `20.0f` (`00 00 A0 41`) | `0.0f` (`00 00 00 00`) | `0x4DD6AD8` | **Stops the engine from adding +20.0 blur bias to textures** |
-| **Tile Heap: Reserve** | `512 MB` (`00 02 00 00`) | `2048 MB` (`00 08 00 00`) | `0x4923A0F` | **Expands the sparse tile memory budget to 2 GB** |
+## What the add-on does
 
----
+It sets a floor under the pool: 2048 MB by default instead of the game's 100 MB. In the same test session the pool held at 2048 MB and the blur stayed flat at about 2.2 mips.
 
-## Recommended In-Game Settings (`renderer.ini`)
+It can also raise the ceiling and cap the blur. Every few seconds it writes the live numbers to `CRStreamingFix.log`.
 
-Located in `%LOCALAPPDATA%\Remedy\CONTROLResonant\renderer.ini`:
+It finds what it needs by code signature. If the signatures don't match your game version, it logs an error and does nothing.
 
-* `"m_eTextureResolution": 2` (High)
-* `"m_eTextureFilteringQuality": 2` (Ultra / 16x Anisotropic Filtering)
-* `"m_iRenderResolutionX": 1707` and `"m_iRenderResolutionY": 960` (DLSS Quality at 1440p output)
-* `"m_bFilmGrain": false`
-* `"m_bDepthOfField": false`
-* `"m_eMotionBlur": 0`
+## Install
 
-### OptiScaler Texture Enhancements (`OptiScaler.ini`)
-* `AnisotropyOverride = 16`
-* `MipmapBiasOverride = -0.5`
-* `MipmapBiasOverrideAll = true`
+1. Install [ReShade](https://reshade.me) **with full add-on support** for the game. RenoDX needs the same build.
+2. Put `CRStreamingFix.addon64` next to `CONTROLResonant.exe`.
+3. Start the game. `CRStreamingFix.ini` and `CRStreamingFix.log` appear in the same folder.
 
----
+To remove it, delete the file.
 
-## How to Install
+It also runs without ReShade: rename it to `CRStreamingFix.asi` and load it with an ASI loader. The offline test covers that path, but it has not been tried in the game.
 
-### Option 1: PowerShell (Windows)
+## Settings
 
-```powershell
-.\patch.ps1 -ExePath "E:\path\to\CONTROLResonant.exe"
+`CRStreamingFix.ini` is re-read while the game runs, so you can alt-tab, edit it and watch the result.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `MinPoolMB` | 2048 | Pool floor. 0 leaves the game's 100 MB. |
+| `MaxPoolMB` | 0 | Pool ceiling. 0 leaves the game's value. |
+| `BiasLimit` | -1 | Largest mip bias the streamer may add. -1 leaves the game's 10. |
+| `LogIntervalSec` | 5 | Seconds between stats lines. 0 turns them off. |
+
+## Tuning
+
+A stats line looks like this:
+
+```
+pool 2048 MB [min 2048, max 3072] | used 1933 MB | demand 1922 MB | bias 2.30 mips | VRAM left for textures 1118-1142 MB (pool is 930 MB above it)
 ```
 
-### Option 2: Python (Cross-platform)
+- **VRAM left for textures** is the pool the game would have picked by itself.
+- **bias** is how many mip levels of blur the streamer is applying. 0 is full resolution.
+- **pool is N MB above it** means the game is using more VRAM than its budget, and Windows pages the difference to system RAM.
 
-```bash
-python patch.py "E:\path\to\CONTROLResonant.exe"
-```
+In the test session the pool sat about 950 MB above free VRAM with no stutter reported, but that was a short session. If you get stutter, lower `MinPoolMB`, or free VRAM another way: frame generation, path tracing quality, render resolution.
 
----
+2048 suits an 8 GB card. For 6 GB, 1536 is a reasonable first guess; it has not been tested.
 
-## How to Revert
+Lowering `BiasLimit` without a bigger pool doesn't sharpen anything, because the pool is also a hard limit on what gets loaded.
 
-```powershell
-.\patch.ps1 -ExePath "E:\path\to\CONTROLResonant.exe" -Revert
-```
+## Tested with
 
-Or restore the automatic backup created at `CONTROLResonant.exe.bak`.
+Game 0.563.737.9, ReShade 6.8.0, RTX 5060 Laptop 8 GB, alongside RenoDX and OptiScaler. That is the only setup it has been played on.
 
----
+## If you used the old patcher from this repo
+
+`patch.py` and `patch.ps1` are gone. They patched the exe based on a misreading of the engine's tweakables. Put back the `CONTROLResonant.exe.bak` they made.
+
+## How it works
+
+Addresses are for 0.563.737.9. The add-on finds them by signature.
+
+| What | Where |
+|---|---|
+| `StreamedTextureHeap` constructor: pool 1 GiB, min 100 MiB, max 3 GiB | `exe+0x1D03BD0` |
+| Pool update from `QueryVideoMemoryInfo` | `exe+0x1D05670` |
+| Ceiling from Texture Resolution | `exe+0x2F17DDB` |
+| Fit-to-pool controller | `exe+0x2E8C3E0` |
+| Mip selection per texture | `exe+0x2E8C9B0` |
+| `StreamedTextureHeap*` | `exe+0x5C36B48`, then `+0x00` pool, `+0x08` min, `+0x10` max |
+| Texture streaming manager | `exe+0x5D2B470`, then `+0x00` demand, `+0x08` bias |
+
+Four times a second the add-on writes the floor (and the ceiling, if set) into the heap object, and the bias limit into the tweakable's value. When it is unloaded it leaves memory alone.
+
+## Build
+
+`build.bat` needs Visual Studio 2022 or its Build Tools (x64).
+
+- `build.bat` builds `build\CRStreamingFix.addon64`.
+- `build.bat test` also runs the offline test. It fakes the game and ReShade to exercise loading, unloading and every setting.
+- `build.bat test "path\to\CONTROLResonant.exe"` also checks that the signatures resolve in that exe.
 
 ## License
 
-MIT License. See [LICENSE](LICENSE) for details.
+MIT

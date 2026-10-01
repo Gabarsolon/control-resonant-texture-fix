@@ -1,7 +1,14 @@
+build/
+dist/
+*.zip
+*.addon64
+*.asi
 *.exe
-*.bak
+*.obj
+*.res
+*.lib
+*.exp
 *.log
-__pycache__/
-*.pyc
+*.bak
 .vscode/
 .idea/
