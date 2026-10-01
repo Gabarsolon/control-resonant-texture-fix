@@ -2,12 +2,12 @@
 
 ReShade add-ons that stop textures in Remedy's Northlight games from going blurry a few minutes into play on 6–8 GB graphics cards, with ray tracing or path tracing left on. They change nothing on disk.
 
-| Game | Add-on | State |
-|---|---|---|
-| Control Resonant | `CRStreamingFix.addon64` | Released. Played on one setup, see [Tested with](#tested-with). |
-| Alan Wake 2 | `AW2StreamingFix.addon64` | Test build. Not run in the game yet, see [Alan Wake 2](#alan-wake-2-test-build). |
+| Game | Add-on | Download | Played on |
+|---|---|---|---|
+| Control Resonant | `CRStreamingFix.addon64` | [v1.1.0](https://github.com/Gabarsolon/remedy-texture-fix/releases/tag/v1.1.0) | game 0.563.737.9, see [Tested with](#tested-with) |
+| Alan Wake 2 | `AW2StreamingFix.addon64` | [v1.0.0](https://github.com/Gabarsolon/remedy-texture-fix/releases/tag/aw2-v1.0.0) | game 0.559.302.8, see [Alan Wake 2](#alan-wake-2) |
 
-Both are built from one source. The rest of this page describes the Control Resonant add-on.
+Both are built from one source and work the same way. The rest of this page describes the Control Resonant add-on. For Alan Wake 2, read `AW2StreamingFix` for `CRStreamingFix` and `AlanWake2.exe` for `CONTROLResonant.exe`.
 
 ## The problem
 
@@ -84,13 +84,21 @@ Lowering `BiasLimit` without a bigger pool doesn't sharpen anything, because the
 
 Game 0.563.737.9, ReShade 6.8.0, RTX 5060 Laptop 8 GB, alongside RenoDX and OptiScaler. That is the only setup it has been played on, panel included.
 
-## Alan Wake 2 (test build)
+## Alan Wake 2
 
-Alan Wake 2 runs the same texture streamer with the same numbers: a 100 MiB floor, ceilings of 1664 MiB, 3 GiB and 4 GiB from Texture Resolution, and the same fit-to-pool controller. `AW2StreamingFix.addon64` is this add-on built for `AlanWake2.exe`.
+Alan Wake 2 runs the same texture streamer with the same numbers: a 100 MiB floor, ceilings of 1664 MiB, 3 GiB and 4 GiB from Texture Resolution, and the same fit-to-pool controller. `AW2StreamingFix.addon64` is this add-on built for `AlanWake2.exe`. Install and settings are as above, with `AW2StreamingFix` in the file names: put `AW2StreamingFix.addon64` next to `AlanWake2.exe`.
 
-**It has not been run in the game yet.** It was made from `AlanWake2.exe` 0.559.302.8 alone. The offline test passes and the signatures resolve in that exe, and that is all that has been checked.
+One test session showed the pool driving the blur directly. It ran on an 8 GB card at 1440p from a 720p render, with path tracing, ray reconstruction and frame generation on and Texture Resolution on High. The pool was moved with the add-on's sliders while standing in one spot:
 
-Install and settings are as above, with `AW2StreamingFix` in the file names: put `AW2StreamingFix.addon64` next to `AlanWake2.exe`. If you try it, please open an issue with `AW2StreamingFix.log` attached, whether it worked or not.
+| Pool | Textures loaded | Blur |
+|---|---|---|
+| 128 MB, forced, as when VRAM runs out | 0.15 GB | 10 mips, the game's limit |
+| 2048 MB, the add-on's default floor | 1.9 GB | 1.2 to 1.5 mips |
+| 8192 MB, forced | 2.9 GB | 0 |
+
+Five minutes in, the game by itself had 1.4 GB left for textures, and that number was still falling.
+
+Tested with game 0.559.302.8 and ReShade 6.8.0 on an RTX 5060 Laptop 8 GB, with no other mods. That is the only setup it has been played on, and the session was short. If it misbehaves for you, please open an issue with `AW2StreamingFix.log` attached.
 
 ## If you used the old patcher from this repo
 

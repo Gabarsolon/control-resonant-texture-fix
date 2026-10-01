@@ -12,8 +12,8 @@
 #define CRSF_NAME "AW2StreamingFix"
 #define CRSF_GAME "Alan Wake 2"
 #define CRSF_EXE "AlanWake2.exe"
-#define CRSF_VERSION "0.1.0"
-#define CRSF_VERSION_NUM 0, 1, 0, 0
+#define CRSF_VERSION "1.0.0"
+#define CRSF_VERSION_NUM 1, 0, 0, 0
 #else
 #define CRSF_NAME "CRStreamingFix"
 #define CRSF_GAME "Control Resonant"
