@@ -1,6 +1,85 @@
-// Offline check: map the game executable as an image and run the add-on's signature logic on it.
-// Nothing is executed from the game; the tweakable values read as 0 because its initialisers never run.
+// Offline check against the real game files: map them as images and run the add-on's own lookup on them.
+// Nothing is executed from the game.
 #include "CRStreamingFix.cpp"
+
+#if defined(CRSF_BACKEND_TWEAKABLES)
+
+// Control: the add-on needs four exports of the game's DLLs and four tweakables by name. With the DLLs
+// only mapped, their initialisers have not run, so the tweakables cannot be looked up; the names are
+// searched for in the renderer image instead.
+namespace
+{
+bool image_contains(HMODULE image, const char *text)
+{
+    const auto base = reinterpret_cast<const uint8_t *>(image);
+    const auto *dos = reinterpret_cast<const IMAGE_DOS_HEADER *>(base);
+    const auto *nt = reinterpret_cast<const IMAGE_NT_HEADERS64 *>(base + dos->e_lfanew);
+    const size_t size = nt->OptionalHeader.SizeOfImage, len = std::strlen(text) + 1;
+    MEMORY_BASIC_INFORMATION info;
+    for (size_t at = 0; at < size && VirtualQuery(base + at, &info, sizeof(info)); at += info.RegionSize)
+    {
+        if (info.State != MEM_COMMIT || (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
+            continue;
+        const auto *p = static_cast<const uint8_t *>(info.BaseAddress);
+        for (size_t i = 0; i + len <= info.RegionSize; ++i)
+            if (p[i] == static_cast<uint8_t>(text[0]) && std::memcmp(p + i, text, len) == 0)
+                return true;
+    }
+    return false;
+}
+} // namespace
+
+int wmain(int argc, wchar_t **argv)
+{
+    if (argc < 2)
+    {
+        std::printf("usage: test_locate <path to " CRSF_EXE " or " CRSF_EXE_ALT ">\n");
+        return 2;
+    }
+    g_log = GetStdHandle(STD_OUTPUT_HANDLE);
+    std::wstring dir = argv[1];
+    const size_t slash = dir.find_last_of(L"\\/");
+    const std::wstring exe = dir.substr(slash == std::wstring::npos ? 0 : slash + 1);
+    dir.resize(slash == std::wstring::npos ? 0 : slash + 1);
+    const bool dx11 = _wcsicmp(exe.c_str(), CRSF_EXE_ALT_W) == 0;
+    const wchar_t *flavour = dx11 ? L"_rmdwin7_f.dll" : L"_rmdwin10_f.dll";
+
+    if (HMODULE image = LoadLibraryExW(argv[1], nullptr, DONT_RESOLVE_DLL_REFERENCES))
+    {
+        char name[64];
+        std::snprintf(name, sizeof(name), "%ls", exe.c_str());
+        log_game_version(reinterpret_cast<uintptr_t>(image), name);
+    }
+    HMODULE renderer = nullptr;
+    for (const wchar_t *part : {L"rl", L"renderer", L"d3d"})
+    {
+        const std::wstring path = dir + part + flavour;
+        HMODULE image = LoadLibraryExW(path.c_str(), nullptr, DONT_RESOLVE_DLL_REFERENCES);
+        if (!image)
+        {
+            std::printf("FAIL could not map %ls (error %lu)\n", path.c_str(), GetLastError());
+            return 1;
+        }
+        if (part[1] == L'e')
+            renderer = image;
+    }
+
+    on_attach();
+    bool ok = g_get_tweakable && g_get_video_memory && g_missing_mips && g_heap_below_limit;
+    std::printf("%s tweakable lookup %s (in %s), VRAM query %s, missing mips %s, pool room flag %s\n", ok ? "OK  " : "FAIL",
+                g_get_tweakable ? "found" : "MISSING", g_tweakable_module, g_get_video_memory ? "found" : "MISSING",
+                g_missing_mips ? "found" : "MISSING", g_heap_below_limit ? "found" : "MISSING");
+    for (const char *name : {"Texture Streaming:Target texture pool size MB", "Texture Streaming:Min Pool Size MB",
+                             "Texture Streaming:Reduce Pool Size After Free VRAM < MB", "Texture Streaming:Mip adjust [Display]"})
+    {
+        const bool present = image_contains(renderer, name);
+        std::printf("%s the renderer registers \"%s\"\n", present ? "OK  " : "FAIL", name);
+        ok = ok && present;
+    }
+    return ok ? 0 : 1;
+}
+
+#else
 
 namespace
 {
@@ -33,6 +112,7 @@ int wmain(int argc, wchar_t **argv)
         return 1;
     }
     const uintptr_t base = reinterpret_cast<uintptr_t>(image);
+    log_game_version(base, CRSF_EXE);
     Targets t;
     bool ok = locate(base, t);
     const auto rva = [base](uintptr_t address) { return static_cast<uint32_t>(address ? address - base : 0); };
@@ -58,3 +138,5 @@ int wmain(int argc, wchar_t **argv)
         std::printf("note: not a build with known addresses, nothing to compare against\n");
     return ok ? 0 : 1;
 }
+
+#endif

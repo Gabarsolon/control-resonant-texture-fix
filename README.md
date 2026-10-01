@@ -6,8 +6,9 @@ ReShade add-ons that stop textures in Remedy's Northlight games from going blurr
 |---|---|---|---|
 | Control Resonant | `CRStreamingFix.addon64` | [v1.1.0](https://github.com/Gabarsolon/remedy-texture-fix/releases/tag/v1.1.0) | game 0.563.737.9, see [Tested with](#tested-with) |
 | Alan Wake 2 | `AW2StreamingFix.addon64` | [v1.0.0](https://github.com/Gabarsolon/remedy-texture-fix/releases/tag/aw2-v1.0.0) | game 0.559.302.8, see [Alan Wake 2](#alan-wake-2) |
+| Control | `ControlStreamingFix.addon64` | [v1.0.0](https://github.com/Gabarsolon/remedy-texture-fix/releases/tag/control-v1.0.0) | game 0.0.518.2177 in DX12, see [Control](#control) |
 
-Both are built from one source and work the same way. The rest of this page describes the Control Resonant add-on. For Alan Wake 2, read `AW2StreamingFix` for `CRStreamingFix` and `AlanWake2.exe` for `CONTROLResonant.exe`.
+All three are built from one source. Control Resonant and Alan Wake 2 work the same way. Control has an older streamer, and its own section. The rest of this page describes the Control Resonant add-on. For Alan Wake 2, read `AW2StreamingFix` for `CRStreamingFix` and `AlanWake2.exe` for `CONTROLResonant.exe`.
 
 ## The problem
 
@@ -100,6 +101,36 @@ Five minutes in, the game by itself had 1.4 GB left for textures, and that numbe
 
 Tested with game 0.559.302.8 and ReShade 6.8.0 on an RTX 5060 Laptop 8 GB, with no other mods. That is the only setup it has been played on, and the session was short. If it misbehaves for you, please open an issue with `AW2StreamingFix.log` attached.
 
+## Control
+
+Control (2019) has an older version of the same system. `ControlStreamingFix.addon64` is the add-on for `Control_DX12.exe` and `Control_DX11.exe`.
+
+What goes wrong there, from disassembling the renderer DLLs of game 0.0.518.2177:
+
+- **Pool size.** Texture Resolution sets the pool directly: 512, 1024, 1664, 2048 or 4096 MB.
+- **The shrink, in DX12 only.** When the game has less than 64 MB of VRAM free, it moves the pool almost all the way to a minimum of 100 MB. Nothing raises it again until you change Texture Resolution. Far enough over its VRAM budget, the result drops below the minimum and can go negative.
+- **Blur.** While the textures in use leave less than 50 MB of the pool free, the engine adds 0.1 mips of blur per update, up to 10.
+
+The DX11 renderer has no shrink. Its pool stays at the Texture Resolution size.
+
+The add-on makes the floor the game's minimum (2048 MB by default instead of 100 MB), and once the game has shrunk the pool that far it holds it there. Differences from the other two add-ons:
+
+- A floor above the pool your Texture Resolution asks for raises the pool to the floor.
+- There is no `MaxPoolMB`. The ceiling is Texture Resolution.
+- The panel shows the pool, the blur and the game's VRAM use against its budget. The game does not keep a running total of loaded textures to show.
+- In DX11 all it can do is raise the pool, and there are no VRAM numbers.
+
+Install it like the others: ReShade with full add-on support, and `ControlStreamingFix.addon64` next to `Control_DX12.exe`.
+
+One test session caught the shrink as it happened. It ran in DX12 on an 8 GB card at 1440p from a 720p render, with every ray tracing effect on and Texture Resolution at its highest setting:
+
+| Floor | What happened |
+|---|---|
+| 64 MB, close to the game's own 100 MB | The game shrank its pool from 4096 MB to 80 MB. Five seconds later the blur was at 10 mips, the game's limit. |
+| 2048 MB, the add-on's default | The pool held at 2048 MB with no blur and room to spare. The game sat 220 to 400 MB over its VRAM budget of about 6.7 GB. |
+
+Tested with game 0.0.518.2177 (Epic) in DX12 and ReShade 6.8.0 on an RTX 5060 Laptop 8 GB, with no other mods. That is the only setup it has been played on, and the session was short. The DX11 build has not been played. The add-on was checked against that build's DLLs: it finds the game's settings there, and the game's own getter confirms what it writes.
+
 ## If you used the old patcher from this repo
 
 `patch.py` and `patch.ps1` are gone. They patched the exe based on a misreading of the engine's tweakables. Put back the `CONTROLResonant.exe.bak` they made.
@@ -130,13 +161,33 @@ The same places in Alan Wake 2 0.559.302.8:
 | `StreamedTextureHeap*` | `exe+0x3A34698`, then `+0x00` pool, `+0x08` min, `+0x10` max |
 | Texture streaming manager | `exe+0x397FEA8`, then `+0x08` demand, `+0x10` bias |
 
+Control 0.0.518.2177 keeps these settings as tweakables: objects the engine looks up by name. The game's `rl` DLL exports that lookup, so the Control add-on asks the game for the ones it needs and uses no signatures.
+
+| What | Where |
+|---|---|
+| Pool shrink, `TextureResourceStreamManager::update` | `renderer_rmdwin10_f.dll+0x168ED0` |
+| Blur, `TextureResource::adjustMipBias` | `renderer_rmdwin10_f.dll+0x159CD0` |
+| Pool from Texture Resolution | `renderer_rmdwin10_f.dll+0x137744` |
+| Tweakable lookup, `d::BaseTweakable::getTweakable` | exported by `rl_rmdwin10_f.dll` |
+| A tweakable | `+0xA8` type, `+0xAC` changed by code, `+0xB0` value, then minimum, maximum, default |
+| Pool, minimum, shrink threshold, blur | `Texture Streaming:Target texture pool size MB`, `:Min Pool Size MB`, `:Reduce Pool Size After Free VRAM < MB`, `:Mip adjust [Display]` |
+
+There the add-on writes the floor into the minimum, lifts a pool that is under the floor, and switches the shrink off while the pool sits on the floor.
+
 ## Build
 
-`build.bat` needs Visual Studio 2022 or its Build Tools (x64). Both games come from one source; `src/game.h` holds what differs.
+`build.bat` needs Visual Studio 2022 or its Build Tools (x64). All three add-ons come from one source:
 
-- `build.bat` builds `build\CRStreamingFix.addon64` and `build\AW2StreamingFix.addon64`.
-- `build.bat test` also runs the offline test for both. It fakes the game and ReShade, menu included, to exercise loading, unloading and every setting.
-- `build.bat test "path\to\CONTROLResonant.exe" "path\to\AlanWake2.exe"` also checks that the signatures resolve in those executables. Either one is enough.
+- `src/CRStreamingFix.cpp`: what they share. Loading, the timer, settings and the tab in the ReShade menu.
+- `src/backend_heap.h`: Control Resonant and Alan Wake 2.
+- `src/backend_tweakables.h`: Control.
+- `src/game.h`: names, versions and offsets per game.
+
+Commands:
+
+- `build.bat` builds `build\CRStreamingFix.addon64`, `build\AW2StreamingFix.addon64` and `build\ControlStreamingFix.addon64`.
+- `build.bat test` also runs the offline test for each. It fakes the game and ReShade, menu included, to exercise loading, unloading and every setting. The Control one also runs the game's pool logic as read from the disassembly, so the fix is tested against the shrink it is there to stop.
+- `build.bat test "path\to\CONTROLResonant.exe" "path\to\AlanWake2.exe" "path\to\Control_DX12.exe"` also checks the add-ons against those games' own files. Any of them is enough. For Control Resonant and Alan Wake 2 it checks that the signatures resolve. For Control it loads the game's `rl` and renderer DLLs, without starting the game, and asks the game's own getter whether the pool is at the floor.
 
 The menu panel is drawn through the ImGui function table that ReShade gives add-ons, so no ImGui code is compiled in. The two headers that takes are in `third_party`.
 
