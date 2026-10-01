@@ -2,15 +2,24 @@
 //
 // The add-on only wakes up inside "CONTROLResonant.exe", so this builds to an exe with that name. It fakes
 // what the add-on looks for (the signature bytes in .text, the heap and manager objects in .data) and plays
-// ReShade by exporting ReShadeRegisterAddon / ReShadeUnregisterAddon. build.bat test runs it.
+// ReShade: it exports the add-on registration functions and hands out an ImGui function table whose
+// widgets are stubs driven by a small script. build.bat test runs it.
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <cstdarg>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <initializer_list>
+#include <map>
 #include <string>
+#include <vector>
+
+#pragma warning(push, 0)
+#include <imgui.h>
+#include <reshade_overlay.hpp>
+#pragma warning(pop)
 
 constexpr uint64_t MiB = 1024ull * 1024ull;
 
@@ -145,6 +154,121 @@ uint32_t rnd(uint32_t n)
     g_seed = g_seed * 1664525u + 1013904223u;
     return (g_seed >> 8) % n;
 }
+
+// ---- fake ReShade menu ------------------------------------------------------------------
+// Only the widgets the add-on uses are stubbed; calling anything else jumps to null and fails the test.
+imgui_function_table g_table = {};
+bool g_table_available = true;
+void (*g_overlay)(void *) = nullptr;
+std::string g_overlay_title;
+
+std::vector<std::string> g_texts;           // everything drawn in the last frame
+std::map<std::string, double> g_shown;      // value each slider showed in the last frame
+std::string g_last_item;
+struct
+{
+    std::string edit;       // slider to change this frame...
+    double value = 0;       // ...to this
+    std::string toggle;     // checkbox to click this frame
+    std::string click;      // button to click this frame
+    std::string release;    // item that reports "released after edit" this frame
+} g_script;
+
+bool g_docked = false;
+int g_wrap_depth = 0; // PushTextWrapPos / PopTextWrapPos must balance
+ImVec2 g_window_pos, g_window_size;
+char g_io_storage[sizeof(ImGuiIO)]; // ImGuiIO's constructor lives in imgui.cpp, which is not linked
+
+void build_fake_menu()
+{
+    reinterpret_cast<ImGuiIO *>(g_io_storage)->DisplaySize = ImVec2(2560.0f, 1440.0f);
+    g_table.GetIO = []() -> ImGuiIO & { return *reinterpret_cast<ImGuiIO *>(g_io_storage); };
+    g_table.GetFontSize = []() { return 20.0f; };
+    g_table.IsWindowDocked = []() { return g_docked; };
+    g_table.SetWindowPos = [](const ImVec2 &pos, ImGuiCond) { g_window_pos = pos; };
+    g_table.SetWindowSize = [](const ImVec2 &size, ImGuiCond) { g_window_size = size; };
+    g_table.PushTextWrapPos = [](float) { ++g_wrap_depth; };
+    g_table.PopTextWrapPos = []() { --g_wrap_depth; };
+    g_table.TextUnformatted = [](const char *text, const char *) { g_texts.emplace_back(text); };
+    g_table.SeparatorText = [](const char *label) { g_texts.emplace_back(label); };
+    g_table.ProgressBar = [](float, const ImVec2 &, const char *overlay) { g_texts.emplace_back(overlay ? overlay : ""); };
+    g_table.SetItemTooltipV = [](const char *, va_list) {};
+    g_table.PushStyleColor2 = [](ImGuiCol, const ImVec4 &) {};
+    g_table.PopStyleColor = [](int) {};
+    g_table.SliderInt = [](const char *label, int *v, int, int, const char *, ImGuiSliderFlags) {
+        g_last_item = label;
+        g_shown[label] = *v;
+        if (g_script.edit != label)
+            return false;
+        *v = static_cast<int>(g_script.value);
+        g_script.edit.clear();
+        return true;
+    };
+    g_table.SliderFloat = [](const char *label, float *v, float, float, const char *, ImGuiSliderFlags) {
+        g_last_item = label;
+        g_shown[label] = *v;
+        if (g_script.edit != label)
+            return false;
+        *v = static_cast<float>(g_script.value);
+        g_script.edit.clear();
+        return true;
+    };
+    g_table.Checkbox = [](const char *label, bool *v) {
+        g_last_item = label;
+        if (g_script.toggle != label)
+            return false;
+        *v = !*v;
+        g_script.toggle.clear();
+        return true;
+    };
+    g_table.Button = [](const char *label, const ImVec2 &) {
+        g_last_item = label;
+        if (g_script.click != label)
+            return false;
+        g_script.click.clear();
+        return true;
+    };
+    g_table.IsItemDeactivatedAfterEdit = []() {
+        if (g_script.release.empty() || g_script.release != g_last_item)
+            return false;
+        g_script.release.clear();
+        return true;
+    };
+}
+
+// The first frame takes the scripted input; the following ones hand it to the add-on's tick thread
+// (the add-on only try-locks, so one frame can miss).
+void frames(int count = 4)
+{
+    for (int i = 0; i < count && g_overlay; ++i)
+    {
+        if (i)
+            Sleep(15);
+        g_texts.clear();
+        g_shown.clear();
+        g_overlay(nullptr);
+    }
+}
+
+bool drew(const char *text)
+{
+    for (const std::string &t : g_texts)
+        if (t.find(text) != std::string::npos)
+            return true;
+    return false;
+}
+
+int ini_int(const wchar_t *key)
+{
+    return static_cast<int>(GetPrivateProfileIntW(L"CRStreamingFix", key, -12345, g_ini.c_str()));
+}
+
+std::wstring ini_str(const wchar_t *key)
+{
+    wchar_t buf[64] = {};
+    GetPrivateProfileStringW(L"CRStreamingFix", key, L"?", buf, 64, g_ini.c_str());
+    return buf;
+}
 } // namespace
 
 extern "C" __declspec(dllexport) bool ReShadeRegisterAddon(HMODULE, uint32_t api_version)
@@ -159,6 +283,20 @@ extern "C" __declspec(dllexport) void ReShadeUnregisterAddon(HMODULE)
 {
     ++g_unregister_calls;
 }
+extern "C" __declspec(dllexport) const imgui_function_table *ReShadeGetImGuiFunctionTable(uint32_t version)
+{
+    return g_table_available && version == IMGUI_VERSION_NUM ? &g_table : nullptr;
+}
+extern "C" __declspec(dllexport) void ReShadeRegisterOverlay(const char *title, void (*callback)(void *))
+{
+    g_overlay_title = title ? title : "";
+    g_overlay = callback;
+}
+extern "C" __declspec(dllexport) void ReShadeUnregisterOverlay(const char *, void (*callback)(void *))
+{
+    if (g_overlay == callback)
+        g_overlay = nullptr;
+}
 
 int wmain()
 {
@@ -172,6 +310,7 @@ int wmain()
     DeleteFileW(g_ini.c_str());
     DeleteFileW(g_log.c_str());
     build_fake_game();
+    build_fake_menu();
 
     std::printf("1. ReShade-style load/unload storm (unloaded before the first tick)\n");
     bool storm_ok = true;
@@ -290,7 +429,75 @@ int wmain()
     check(GetModuleHandleW(L"CRStreamingFix.asi") == nullptr, "module gone after unload");
     set_ini(2048, 0, "-1");
 
-    std::printf("8. Exit with the add-on loaded\n");
+    std::printf("8. Settings tab in the ReShade menu\n");
+    m = LoadLibraryW(g_addon.c_str());
+    check(g_overlay != nullptr && g_overlay_title == "CRStreamingFix", "tab registered with ReShade");
+    frames(1);
+    check(drew("Starting..."), "says it is starting before the first tick");
+    Sleep(1600);
+    frames();
+    check(drew("MB used") && drew("Blur: 2.20 mips") && drew("The game alone would give textures 1100-1300 MB"),
+          "shows pool, blur and what the game would have left");
+    check(g_shown["Minimum pool"] == 2048, "slider shows the current minimum");
+    check(g_window_size.x == 680.0f && g_window_pos.x == 2560.0f - 680.0f - 40.0f && drew("Tip: drag"),
+          "a floating window is placed on the right and explains docking");
+    g_docked = true;
+    g_window_pos = ImVec2();
+    frames();
+    check(g_window_pos.x == 0.0f && !drew("Tip: drag"), "a docked tab is left alone");
+    g_docked = false;
+    *reinterpret_cast<uint64_t *>(g_stats + 0x1B0) = 1100 * MiB; // low and high equal
+    frames();
+    check(drew("The game alone would give textures 1100 MB") && !drew("1100-1100"), "an equal range is shown as one number");
+    *reinterpret_cast<uint64_t *>(g_stats + 0x1B0) = 1300 * MiB;
+    check(g_wrap_depth == 0, "text wrap pushes and pops balance");
+    g_script.edit = "Minimum pool";
+    g_script.value = 1536;
+    frames();
+    Sleep(500);
+    check(g_heap_obj[1] == 1536 * MiB, "dragging the slider applies within a tick");
+    check(ini_int(L"MinPoolMB") == 2048, "ini not written while dragging");
+    g_script.release = "Minimum pool";
+    frames();
+    Sleep(500);
+    check(ini_int(L"MinPoolMB") == 1536, "ini written when the slider is released");
+    g_script.toggle = "Limit blur";
+    frames();
+    Sleep(500);
+    check(g_bias_limit == 2.0f && ini_str(L"BiasLimit") == L"2.00", "Limit blur switches the cap on at 2 mips and saves it");
+    g_script.edit = "Blur limit";
+    g_script.value = 3.5;
+    g_script.release = "Blur limit";
+    frames();
+    Sleep(500);
+    check(g_bias_limit == 3.5f && ini_str(L"BiasLimit") == L"3.50", "blur limit slider applies and saves");
+    g_script.click = "Defaults";
+    frames();
+    Sleep(500);
+    check(g_heap_obj[1] == 2048 * MiB && g_bias_limit == 10.0f, "Defaults restores 2048 MB and the game's blur limit");
+    check(ini_int(L"MinPoolMB") == 2048 && ini_str(L"BiasLimit") == L"-1", "Defaults is saved");
+    set_ini(1792, 0, "-1");
+    frames();
+    check(g_shown["Minimum pool"] == 1792, "an edit of the ini file shows up in the tab");
+    check(log_contains("Config saved from the ReShade menu"), "saves are logged");
+    FreeLibrary(m);
+    check(g_overlay == nullptr && !loaded(), "tab unregistered on unload");
+    set_ini(2048, 0, "-1");
+
+    std::printf("9. ReShade without the ImGui 1.92.5 table\n");
+    g_table_available = false;
+    m = LoadLibraryW(g_addon.c_str());
+    Sleep(1600);
+    set_ini(1600, 0, "-1");
+    check(m != nullptr && g_overlay == nullptr, "loads without a settings tab");
+    check(g_heap_obj[1] == 1600 * MiB, "the fix still works through the ini");
+    check(log_contains("no settings tab"), "log says why there is no tab");
+    if (m)
+        FreeLibrary(m);
+    g_table_available = true;
+    set_ini(2048, 0, "-1");
+
+    std::printf("10. Exit with the add-on loaded\n");
     m = LoadLibraryW(g_addon.c_str());
     Sleep(1300);
     check(m != nullptr, "loaded; the process now exits without unloading it");

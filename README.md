@@ -20,7 +20,7 @@ In one test session (8 GB card, 1440p, path tracing, ray reconstruction and fram
 
 It sets a floor under the pool: 2048 MB by default instead of the game's 100 MB. In the same test session the pool held at 2048 MB and the blur stayed flat at about 2.2 mips.
 
-It can also raise the ceiling and cap the blur. Every few seconds it writes the live numbers to `CRStreamingFix.log`.
+It can also raise the ceiling and cap the blur. The settings and the live numbers are in a panel in the ReShade menu, and in `CRStreamingFix.ini` and `CRStreamingFix.log`.
 
 It finds what it needs by code signature. If the signatures don't match your game version, it logs an error and does nothing.
 
@@ -34,9 +34,19 @@ To remove it, delete the file.
 
 It also runs without ReShade: rename it to `CRStreamingFix.asi` and load it with an ASI loader. The offline test covers that path, but it has not been tried in the game.
 
+## In the ReShade menu
+
+Open the ReShade menu and look for the **CRStreamingFix** window. It shows the pool, how full it is, the current blur and what the game would have left for textures by itself. Below that are the settings.
+
+- Changes apply within a quarter of a second. No restart.
+- A slider is saved to `CRStreamingFix.ini` when you let go of it.
+- If the window isn't already a tab, it starts as a floating window on the right. Drag its title onto the ReShade tab bar to dock it.
+
+The panel needs a ReShade build that carries ImGui 1.92.5, such as 6.8.0. On other builds the add-on still works; it just has no panel, and the log says so.
+
 ## Settings
 
-`CRStreamingFix.ini` is re-read while the game runs, so you can alt-tab, edit it and watch the result.
+The panel and `CRStreamingFix.ini` hold the same four settings. The ini is re-read while the game runs, so editing it by hand works too.
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -65,7 +75,7 @@ Lowering `BiasLimit` without a bigger pool doesn't sharpen anything, because the
 
 ## Tested with
 
-Game 0.563.737.9, ReShade 6.8.0, RTX 5060 Laptop 8 GB, alongside RenoDX and OptiScaler. That is the only setup it has been played on.
+Game 0.563.737.9, ReShade 6.8.0, RTX 5060 Laptop 8 GB, alongside RenoDX and OptiScaler. That is the only setup it has been played on, panel included.
 
 ## If you used the old patcher from this repo
 
@@ -92,9 +102,11 @@ Four times a second the add-on writes the floor (and the ceiling, if set) into t
 `build.bat` needs Visual Studio 2022 or its Build Tools (x64).
 
 - `build.bat` builds `build\CRStreamingFix.addon64`.
-- `build.bat test` also runs the offline test. It fakes the game and ReShade to exercise loading, unloading and every setting.
+- `build.bat test` also runs the offline test. It fakes the game and ReShade, menu included, to exercise loading, unloading and every setting.
 - `build.bat test "path\to\CONTROLResonant.exe"` also checks that the signatures resolve in that exe.
+
+The menu panel is drawn through the ImGui function table that ReShade gives add-ons, so no ImGui code is compiled in. The two headers that takes are in `third_party`.
 
 ## License
 
-MIT
+MIT. The headers in `third_party` keep their own licenses: Dear ImGui is MIT, and ReShade's `reshade_overlay.hpp` is BSD-3-Clause OR MIT. See `third_party/README.md`.
