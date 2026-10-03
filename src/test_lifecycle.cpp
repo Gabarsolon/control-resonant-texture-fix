@@ -19,6 +19,10 @@ volatile uint64_t g_other_ptr = 1; // Alan Wake 2: some other job's object
 volatile float g_bias_limit = 10.0f;
 float g_high = 0.1f, g_low = 0.05f, g_rate = 0.1f;
 
+// Where this fake game keeps its stats. Not the offsets of any real build: the add-on has to read them
+// out of the fake code below, the way it does with a game update that moved them.
+constexpr uint32_t kHeapBytes = 0x238, kLeftLo = 0x1F0, kLeftHi = 0x1F8;
+
 namespace
 {
 // ---- fake game code (.text): never executed, only scanned -------------------------------
@@ -26,11 +30,17 @@ namespace
 #pragma section(".text", read, execute)
 __declspec(allocate(".text")) unsigned char g_code[0x8000] = {0xCC};
 size_t g_manager_site = 0; // where in g_code the instructions are that give away the manager pointer
+size_t g_left_site = 0;    // ... the "VRAM left" offsets
+size_t g_tiles_site = 0;   // ... that the tile count is where game.h says
 
 void put(size_t at, std::initializer_list<int> bytes)
 {
     for (int b : bytes)
         g_code[at++] = static_cast<unsigned char>(b);
+}
+void put32(size_t at, uint32_t value)
+{
+    std::memcpy(g_code + at, &value, 4);
 }
 void rel32(size_t at, const volatile void *target)
 {
@@ -113,12 +123,33 @@ void build_fake_game()
     put(fit + limit, {0xC5, 0xCA, 0x5D, 0x35});
     rel32(fit + limit + 4, &g_bias_limit);
 
+    // The heap's pool update, where both games touch the stats fields:
+    //   mov rdx,[rax+HEAP_BYTES] ; mov rax,[rdi+18] ; mov r8,[rax+20]
+    //   mov rcx,[rdi+18] ; mov rax,[rcx+LEFT_LO] ; cmp rsi,rax ; cmovb rax,rsi ; mov [rcx+LEFT_LO],rax
+    //   mov rcx,[rdi+18] ; mov rax,[rcx+LEFT_HI] ; cmp rax,rsi ; cmovb rax,rsi ; mov [rcx+LEFT_HI],rax
+    const size_t update = 0x400, left_site = update + 0x30, tiles_site = 0x480;
+    put(update, {0x48, 0x8B, 0x90, 0, 0, 0, 0, 0x48, 0x8B, 0x47, 0x18, 0x4C, 0x8B, 0x40, 0x20});
+    put32(update + 3, kHeapBytes);
+    put(left_site, {0x48, 0x8B, 0x4F, 0x18, 0x48, 0x8B, 0x81, 0, 0, 0, 0, 0x48, 0x3B, 0xF0, 0x48, 0x0F, 0x42,
+                    0xC6, 0x48, 0x89, 0x81, 0, 0, 0, 0, 0x48, 0x8B, 0x4F, 0x18, 0x48, 0x8B, 0x81, 0, 0, 0,
+                    0,    0x48, 0x3B, 0xC6, 0x48, 0x0F, 0x42, 0xC6, 0x48, 0x89, 0x81, 0, 0, 0, 0});
+    put32(left_site + 7, kLeftLo);
+    put32(left_site + 21, kLeftLo);
+    put32(left_site + 32, kLeftHi);
+    put32(left_site + 46, kLeftHi);
+    // Where the heap adds up what it holds: mov rbx,[rax+HEAP_BYTES] ; mov r14,rax ; mov rcx,[rax+TILES]
+    put(tiles_site, {0x48, 0x8B, 0x98, 0, 0, 0, 0, 0x4C, 0x8B, 0xF0, 0x48, 0x8B, 0x88, 0, 0, 0, 0});
+    put32(tiles_site + 3, kHeapBytes);
+    put32(tiles_site + 13, kLayout.stats_tiles);
+    g_left_site = left_site;
+    g_tiles_site = tiles_site + 10;
+
     // Objects: junk everywhere except the fields the add-on is supposed to read.
     std::memset(g_stats, 0xA5, sizeof(g_stats));
-    stat(kLayout.stats_tiles) = 4096;            // 64 KiB tiles
-    stat(kLayout.stats_left_lo) = 0;             // "left": the game's not-sampled-yet state is 0 and ~0
-    stat(kLayout.stats_left_hi) = ~0ull;
-    stat(kLayout.stats_heap_bytes) = 1500 * MiB; // heap bytes
+    stat(kLayout.stats_tiles) = 4096; // 64 KiB tiles
+    stat(kLeftLo) = 0;                // "left": the game's not-sampled-yet state is 0 and ~0
+    stat(kLeftHi) = ~0ull;
+    stat(kHeapBytes) = 1500 * MiB;    // heap bytes
     g_heap_obj[3] = reinterpret_cast<uint64_t>(g_stats);
     std::memset(g_mgr_obj, 0xA5, sizeof(g_mgr_obj));
     const uint64_t demand = 1900 * MiB;
@@ -187,6 +218,10 @@ int wmain()
     check(g_heap_obj[1] == 100 * MiB, "nothing written before the renderer exists");
     check(GetFileAttributesW(g_ini.c_str()) != INVALID_FILE_ATTRIBUTES, "default ini created");
     check(log_contains("manager ptr exe+0x"), "streaming manager found");
+    char fields[96];
+    std::snprintf(fields, sizeof(fields), "Stats fields: heap bytes +0x%X, tiles +0x%X, VRAM left +0x%X/+0x%X", kHeapBytes,
+                  kLayout.stats_tiles, kLeftLo, kLeftHi);
+    check(log_contains(fields), "stats fields read out of the game's code, not assumed");
     g_heap_ptr = reinterpret_cast<uint64_t>(&g_heap_obj[0]);
     Sleep(700);
     check(g_heap_obj[1] == 2048 * MiB, "min pool raised to 2048 MB");
@@ -202,8 +237,8 @@ int wmain()
     Sleep(1200);
     check(log_contains("used 1756 MB | demand 1900 MB | bias 2.20 mips | VRAM left for textures n/a"),
           "stats show use, demand and bias, and n/a until the game has sampled its VRAM budget");
-    stat(kLayout.stats_left_lo) = 1100 * MiB; // the game sampled: 1100-1300 MB left
-    stat(kLayout.stats_left_hi) = 1300 * MiB;
+    stat(kLeftLo) = 1100 * MiB; // the game sampled: 1100-1300 MB left
+    stat(kLeftHi) = 1300 * MiB;
     Sleep(1200);
     check(log_contains("VRAM left for textures 1100-1300 MB (pool is 948 MB above it)"),
           "stats show what the game would have left for textures");
@@ -289,10 +324,10 @@ int wmain()
     frames();
     check(g_window_pos.x == 0.0f && !drew("Tip: drag"), "a docked tab is left alone");
     g_docked = false;
-    stat(kLayout.stats_left_hi) = 1100 * MiB; // low and high equal
+    stat(kLeftHi) = 1100 * MiB; // low and high equal
     frames();
     check(drew("The game alone would give textures 1100 MB") && !drew("1100-1100"), "an equal range is shown as one number");
-    stat(kLayout.stats_left_hi) = 1300 * MiB;
+    stat(kLeftHi) = 1300 * MiB;
     check(g_wrap_depth == 0, "text wrap pushes and pops balance");
     g_script.edit = "Minimum pool";
     g_script.value = 1536;
@@ -361,7 +396,30 @@ int wmain()
     if (m)
         FreeLibrary(m);
 
-    std::printf("11. Unsupported game version (fit-to-pool not found)\n");
+    std::printf("11. Game build whose stats fields are not where the code is expected to show them\n");
+    g_code[g_left_site + 4] ^= 0xFF;
+    m = LoadLibraryW(g_addon.c_str());
+    Sleep(1600);
+    frames();
+    check(g_heap_obj[1] == 2048 * MiB, "the fix still applies");
+    check(drew("Pool: 2048 MB") && !drew("MB used") && !drew("The game alone would give textures"),
+          "tab shows the pool size only, no numbers read from guessed offsets");
+    check(log_contains("Stats fields: pool use not found, VRAM left not found") && log_contains("| used n/a |"),
+          "log says so and the stats lines say n/a");
+    if (m)
+        FreeLibrary(m);
+    g_code[g_left_site + 4] ^= 0xFF;
+    g_code[g_tiles_site] ^= 0xFF; // the tile count is no longer read where game.h says
+    m = LoadLibraryW(g_addon.c_str());
+    Sleep(1600);
+    frames();
+    check(drew("Pool: 2048 MB") && !drew("MB used") && drew("The game alone would give textures"),
+          "pool use is left out when the tile count cannot be confirmed; VRAM left is still shown");
+    if (m)
+        FreeLibrary(m);
+    g_code[g_tiles_site] ^= 0xFF;
+
+    std::printf("12. Unsupported game version (fit-to-pool not found)\n");
     g_code[0] ^= 0xFF;
     g_heap_obj[1] = 100 * MiB;
     m = LoadLibraryW(g_addon.c_str());
@@ -375,7 +433,7 @@ int wmain()
     check(!loaded(), "unloads cleanly");
     g_code[0] ^= 0xFF;
 
-    std::printf("12. Exit with the add-on loaded\n");
+    std::printf("13. Exit with the add-on loaded\n");
     m = LoadLibraryW(g_addon.c_str());
     Sleep(1300);
     check(m != nullptr, "loaded; the process now exits without unloading it");

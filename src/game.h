@@ -28,8 +28,8 @@
 #define CRSF_NAME "CRStreamingFix"
 #define CRSF_GAME "Control Resonant"
 #define CRSF_EXE "CONTROLResonant.exe"
-#define CRSF_VERSION "1.1.0"
-#define CRSF_VERSION_NUM 1, 1, 0, 0
+#define CRSF_VERSION "1.1.1"
+#define CRSF_VERSION_NUM 1, 1, 1, 0
 #define CRSF_BACKEND_HEAP
 #endif
 
@@ -46,20 +46,20 @@
 
 // Control Resonant and Alan Wake 2: offsets inside the game's objects. The heap object itself is the
 // same in both: +0x00 pool, +0x08 minimum, +0x10 maximum, +0x18 pointer to its stats.
+//
+// The other stats fields the add-on shows (bytes in whole heaps, "VRAM left for textures") move between
+// game updates, so they are read out of the game's code at startup (locate_stats in backend_heap.h).
 struct GameLayout
 {
-    uint32_t stats_heap_bytes; // bytes in whole heaps
-    uint32_t stats_tiles;      // 64 KiB tiles in use
-    uint32_t stats_left_lo;    // lowest "VRAM left for textures" in the current sampling window
-    uint32_t stats_left_hi;    // highest
-    uint32_t mgr_demand;       // texture streaming manager: bytes wanted at the current bias
-    uint32_t mgr_bias;         // texture streaming manager: current mip bias (float)
+    uint32_t stats_tiles; // 64 KiB tiles in use. Used only if the game's code is seen reading it at this offset.
+    uint32_t mgr_demand;  // texture streaming manager: bytes wanted at the current bias
+    uint32_t mgr_bias;    // texture streaming manager: current mip bias (float)
 };
 
 #if defined(CRSF_GAME_AW2)
-constexpr GameLayout kLayout = {0x210, 0x170, 0x1D8, 0x1E0, 0x08, 0x10}; // AlanWake2.exe 0.559.302.8
+constexpr GameLayout kLayout = {0x170, 0x08, 0x10}; // AlanWake2.exe 0.559.302.8
 #else
-constexpr GameLayout kLayout = {0x1E0, 0x140, 0x1A8, 0x1B0, 0x00, 0x08}; // CONTROLResonant.exe 0.563.737.9
+constexpr GameLayout kLayout = {0x140, 0x00, 0x08}; // CONTROLResonant.exe 0.563.737.9 and 0.564.208.5
 #endif
 
 #endif // heap backend, not the resource compiler

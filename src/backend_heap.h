@@ -27,6 +27,18 @@ constexpr bool kHasMaxPool = true;
     "; 0 = leave the game's value.\r\n"                                                                        \
     "MaxPoolMB=0\r\n"
 
+// Where the heap's stats object keeps the numbers shown in the log and the settings tab. Only for
+// display: the fix itself does not depend on them.
+struct StatsLayout
+{
+    bool used_known = false;  // heap_bytes and tiles are usable
+    bool left_known = false;  // left_lo and left_hi are usable
+    uint32_t heap_bytes = 0;  // bytes in whole heaps
+    uint32_t tiles = 0;       // 64 KiB tiles in use
+    uint32_t left_lo = 0;     // lowest "VRAM left for textures" in the current sampling window
+    uint32_t left_hi = 0;     // highest
+};
+
 struct Targets
 {
     uintptr_t heap_ptr = 0;       // global: StreamedTextureHeap*
@@ -35,6 +47,7 @@ struct Targets
     uintptr_t high_threshold = 0; // float "Fit to pool:High memory threshold"
     uintptr_t low_threshold = 0;  // float "Fit to pool:Low memory threshold"
     uintptr_t bias_rate = 0;      // float "Fit to pool:Rate of bias change"
+    StatsLayout stats;
 };
 
 // The game's own values, read before the first write. Kept in a process environment variable
@@ -228,7 +241,7 @@ bool locate_game(const Section &text, Targets &t, uintptr_t &f)
 
 #else
 
-// Control Resonant (CONTROLResonant.exe 0.563.737.9).
+// Control Resonant (CONTROLResonant.exe 0.563.737.9 and 0.564.208.5).
 bool locate_game(const Section &text, Targets &t, uintptr_t &f)
 {
     //   ... ; call StreamedTextureHeap::get ; mov rcx,rax ; call StreamedTextureHeap::poolSize
@@ -272,6 +285,66 @@ bool locate_game(const Section &text, Targets &t, uintptr_t &f)
 
 #endif
 
+uint32_t disp32(uintptr_t addr)
+{
+    return *reinterpret_cast<const uint32_t *>(addr);
+}
+
+// The stats fields are not at a fixed place: Control Resonant 0.564 moved them by 0x38 bytes. Both games
+// update them in the heap's pool update, with the same instructions, so the offsets are taken from there:
+//   mov rdx,[rax+HEAP_BYTES] ; mov rax,[heap+18] ; mov r,[rax+20]            (what the streamer holds)
+//   ...
+//   mov rcx,[heap+18] ; mov rax,[rcx+LEFT_LO] ; cmp ; cmovb ; mov [rcx+LEFT_LO],rax
+//   mov rcx,[heap+18] ; mov rax,[rcx+LEFT_HI] ; cmp ; cmovb ; mov [rcx+LEFT_HI],rax
+// Anything that does not look exactly like that leaves the field unknown, and it is not shown.
+void locate_stats(const Section &text, StatsLayout &s)
+{
+    const auto window = scan(text, "48 8B ?? 18 48 8B 81 ?? ?? ?? ?? 48 3B ?? 48 0F 42 ?? 48 89 81 ?? ?? ?? ?? "
+                                   "48 8B ?? 18 48 8B 81 ?? ?? ?? ?? 48 3B ?? 48 0F 42 ?? 48 89 81 ?? ?? ?? ??");
+    if (window.size() != 1)
+        return;
+    const uintptr_t w = window[0];
+    const uint32_t lo = disp32(w + 7), hi = disp32(w + 32);
+    if (lo != disp32(w + 21) || hi != disp32(w + 46) || hi != lo + 8 || hi >= 0x1000 || lo % 8 != 0)
+        return;
+    s.left_lo = lo;
+    s.left_hi = hi;
+    s.left_known = true;
+
+    Section before;
+    before.begin = std::max(text.begin, w - 0x60);
+    before.end = w;
+    const auto held = scan(before, "48 8B 90 ?? ?? ?? ?? 48 8B ?? 18 ?? 8B 40 20");
+    if (held.size() != 1)
+        return;
+    const uint32_t heap_bytes = disp32(held[0] + 3);
+    if (heap_bytes >= 0x1000 || heap_bytes % 8 != 0 || heap_bytes == lo || heap_bytes == hi)
+        return;
+
+    // The tile count has no instruction of its own to recognise. Its offset is taken from game.h and only
+    // trusted if the heap's code reads it right after the heap bytes, the way it does when it adds the two.
+    char pattern[32];
+    std::snprintf(pattern, sizeof(pattern), "48 8B ?? %02X %02X %02X %02X", heap_bytes & 0xFF, (heap_bytes >> 8) & 0xFF,
+                  (heap_bytes >> 16) & 0xFF, heap_bytes >> 24);
+    Section around; // the heap's other functions sit next to the pool update
+    around.begin = w - text.begin > 0x4000 ? w - 0x4000 : text.begin;
+    around.end = std::min(text.end, w + 0x4000);
+    const uint32_t tiles = kLayout.stats_tiles;
+    for (uintptr_t hit : scan(around, pattern, SIZE_MAX))
+    {
+        for (uintptr_t at = hit + 7; at + 7 <= around.end && at <= hit + 24; ++at)
+        {
+            if (bytes_match(at, "48 8B") && disp32(at + 3) == tiles)
+            {
+                s.heap_bytes = heap_bytes;
+                s.tiles = tiles;
+                s.used_known = true;
+                return;
+            }
+        }
+    }
+}
+
 bool locate(uintptr_t base, Targets &t)
 {
     Section text, data;
@@ -302,6 +375,15 @@ bool locate(uintptr_t base, Targets &t)
         std::snprintf(manager, sizeof(manager), "exe+0x%llX", static_cast<unsigned long long>(t.mgr_ptr - base));
     log_line("Found fit-to-pool at exe+0x%llX, heap ptr exe+0x%llX, manager ptr %s",
              static_cast<unsigned long long>(f - base), static_cast<unsigned long long>(t.heap_ptr - base), manager);
+
+    locate_stats(text, t.stats);
+    char used[48] = "pool use not found", left[48] = "VRAM left not found";
+    if (t.stats.used_known)
+        std::snprintf(used, sizeof(used), "heap bytes +0x%X, tiles +0x%X", t.stats.heap_bytes, t.stats.tiles);
+    if (t.stats.left_known)
+        std::snprintf(left, sizeof(left), "VRAM left +0x%X/+0x%X", t.stats.left_lo, t.stats.left_hi);
+    log_line("Stats fields: %s, %s%s", used, left,
+             t.stats.used_known && t.stats.left_known ? "" : " (what is not found is left out of the stats)");
     return true;
 }
 
@@ -409,7 +491,9 @@ void apply(const Targets &t, const Config &c, Baseline &b, bool &announce)
 struct Live
 {
     bool renderer = false; // heap object exists
-    uint64_t pool = 0, min_pool = 0, max_pool = 0, used = 0;
+    uint64_t pool = 0, min_pool = 0, max_pool = 0;
+    bool used_valid = false; // how much of the pool is filled could be read
+    uint64_t used = 0;
     bool manager = false; // demand and bias could be read
     uint64_t demand = 0;
     float bias = 0.0f;
@@ -430,16 +514,16 @@ Live read_live(const Targets &t)
     read_u64(heap + 0x08, v.min_pool);
     read_u64(heap + 0x10, v.max_pool);
     read_u64(heap + 0x18, st);
-    if (st)
+    if (st && t.stats.used_known && read_u64(st + t.stats.heap_bytes, heap_bytes) && read_u64(st + t.stats.tiles, tiles))
     {
-        read_u64(st + kLayout.stats_heap_bytes, heap_bytes);
-        read_u64(st + kLayout.stats_tiles, tiles);
-        read_u64(st + kLayout.stats_left_lo, v.left_lo);
-        read_u64(st + kLayout.stats_left_hi, v.left_hi);
+        v.used = heap_bytes + (tiles << 16);
+        v.used_valid = true;
+    }
+    if (st && t.stats.left_known && read_u64(st + t.stats.left_lo, v.left_lo) && read_u64(st + t.stats.left_hi, v.left_hi))
+    {
         // Until the game has sampled once, the two fields hold 0 and ~0.
         v.left_valid = v.left_lo <= v.left_hi && v.left_hi <= (1ull << 50);
     }
-    v.used = heap_bytes + (tiles << 16);
     if (t.mgr_ptr && read_u64(t.mgr_ptr, mgr) && mgr)
     {
         // Shown only if it looks like a mip bias and a byte count, in case a game update moved the fields.
@@ -491,10 +575,13 @@ void log_stats(const Targets &t)
     else
         std::snprintf(streamer, sizeof(streamer), "demand n/a | bias n/a");
 
-    log_line("pool %4llu MB [min %llu, max %llu] | used %4llu MB | %s | VRAM left for textures %s",
+    char used[32] = "used n/a";
+    if (v.used_valid)
+        std::snprintf(used, sizeof(used), "used %4llu MB", static_cast<unsigned long long>(v.used / kMiB));
+
+    log_line("pool %4llu MB [min %llu, max %llu] | %s | %s | VRAM left for textures %s",
              static_cast<unsigned long long>(v.pool / kMiB), static_cast<unsigned long long>(v.min_pool / kMiB),
-             static_cast<unsigned long long>(v.max_pool / kMiB), static_cast<unsigned long long>(v.used / kMiB),
-             streamer, left);
+             static_cast<unsigned long long>(v.max_pool / kMiB), used, streamer, left);
 }
 
 // The "Right now" part of the settings tab.
@@ -507,11 +594,20 @@ void draw_status(const Live &v)
     }
 
     char text[192];
-    std::snprintf(text, sizeof(text), "%llu of %llu MB used", static_cast<unsigned long long>(v.used / kMiB),
-                  static_cast<unsigned long long>(v.pool / kMiB));
-    ImGui::ProgressBar(v.pool ? static_cast<float>(static_cast<double>(v.used) / static_cast<double>(v.pool)) : 0.0f,
-                       ImVec2(-FLT_MIN, 0.0f), text);
-    tooltip("The texture streaming pool and how much of it is filled.");
+    if (v.used_valid)
+    {
+        std::snprintf(text, sizeof(text), "%llu of %llu MB used", static_cast<unsigned long long>(v.used / kMiB),
+                      static_cast<unsigned long long>(v.pool / kMiB));
+        ImGui::ProgressBar(v.pool ? static_cast<float>(static_cast<double>(v.used) / static_cast<double>(v.pool)) : 0.0f,
+                           ImVec2(-FLT_MIN, 0.0f), text);
+        tooltip("The texture streaming pool and how much of it is filled.");
+    }
+    else
+    {
+        std::snprintf(text, sizeof(text), "Pool: %llu MB", static_cast<unsigned long long>(v.pool / kMiB));
+        ImGui::TextUnformatted(text);
+        tooltip("The texture streaming pool. How much of it is filled could not be read in this game version.");
+    }
 
     if (v.manager)
     {

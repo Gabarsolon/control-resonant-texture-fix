@@ -4,7 +4,7 @@ ReShade add-ons that stop textures in Remedy's Northlight games from going blurr
 
 | Game | Add-on | Download | Played on |
 |---|---|---|---|
-| Control Resonant | `CRStreamingFix.addon64` | [v1.1.0](https://github.com/Gabarsolon/remedy-texture-fix/releases/tag/v1.1.0) | game 0.563.737.9, see [Tested with](#tested-with) |
+| Control Resonant | `CRStreamingFix.addon64` | [v1.1.1](https://github.com/Gabarsolon/remedy-texture-fix/releases/tag/v1.1.1) | game 0.564.208.5 and 0.563.737.9, see [Tested with](#tested-with) |
 | Alan Wake 2 | `AW2StreamingFix.addon64` | [v1.0.0](https://github.com/Gabarsolon/remedy-texture-fix/releases/tag/aw2-v1.0.0) | game 0.559.302.8, see [Alan Wake 2](#alan-wake-2) |
 | Control | `ControlStreamingFix.addon64` | [v1.0.0](https://github.com/Gabarsolon/remedy-texture-fix/releases/tag/control-v1.0.0) | game 0.0.518.2177 in DX12, see [Control](#control) |
 
@@ -30,7 +30,7 @@ It sets a floor under the pool: 2048 MB by default instead of the game's 100 MB.
 
 It can also raise the ceiling and cap the blur. The settings and the live numbers are in a panel in the ReShade menu, and in `CRStreamingFix.ini` and `CRStreamingFix.log`.
 
-It finds what it needs by code signature. If the signatures don't match your game version, it logs an error and does nothing.
+It finds what it needs by code signature. If the signatures don't match your game version, it logs an error and does nothing. The numbers it shows come from fields that game updates move around, so it reads their positions out of the game's code too, and leaves out any number it cannot place.
 
 ## Install
 
@@ -83,7 +83,9 @@ Lowering `BiasLimit` without a bigger pool doesn't sharpen anything, because the
 
 ## Tested with
 
-Game 0.563.737.9, ReShade 6.8.0, RTX 5060 Laptop 8 GB, alongside RenoDX and OptiScaler. That is the only setup it has been played on, panel included.
+Game 0.564.208.5 with v1.1.1, and game 0.563.737.9 with the versions before it. ReShade 6.8.0, RTX 5060 Laptop 8 GB, alongside RenoDX and OptiScaler. That is the only setup it has been played on, panel included.
+
+On game 0.564 use v1.1.1 or later. Older versions still apply the fix there, but the game update moved the fields behind "MB used" and "VRAM left for textures", so they show wrong numbers.
 
 ## Alan Wake 2
 
@@ -149,6 +151,8 @@ Addresses are for 0.563.737.9. The add-on finds them by signature.
 | `StreamedTextureHeap*` | `exe+0x5C36B48`, then `+0x00` pool, `+0x08` min, `+0x10` max |
 | Texture streaming manager | `exe+0x5D2B470`, then `+0x00` demand, `+0x08` bias |
 
+Game 0.564.208.5 has the same code at other addresses: the fit-to-pool controller at `exe+0x2ED9400`, the pool update at `exe+0x1D2CAC0`, `StreamedTextureHeap*` at `exe+0x5D07328` and the texture streaming manager at `exe+0x5E00C70`. The heap's stats object grew by 0x38 bytes in that update, which moved the bytes-in-heaps field from `+0x1E0` to `+0x218` and the "VRAM left" pair from `+0x1A8` to `+0x1E0`.
+
 Four times a second the add-on writes the floor (and the ceiling, if set) into the heap object, and the bias limit into the tweakable's value. When it is unloaded it leaves memory alone.
 
 The same places in Alan Wake 2 0.559.302.8:
@@ -181,13 +185,13 @@ There the add-on writes the floor into the minimum, lifts a pool that is under t
 - `src/CRStreamingFix.cpp`: what they share. Loading, the timer, settings and the tab in the ReShade menu.
 - `src/backend_heap.h`: Control Resonant and Alan Wake 2.
 - `src/backend_tweakables.h`: Control.
-- `src/game.h`: names, versions and offsets per game.
+- `src/game.h`: names, versions and the few fixed offsets per game.
 
 Commands:
 
 - `build.bat` builds `build\CRStreamingFix.addon64`, `build\AW2StreamingFix.addon64` and `build\ControlStreamingFix.addon64`.
 - `build.bat test` also runs the offline test for each. It fakes the game and ReShade, menu included, to exercise loading, unloading and every setting. The Control one also runs the game's pool logic as read from the disassembly, so the fix is tested against the shrink it is there to stop.
-- `build.bat test "path\to\CONTROLResonant.exe" "path\to\AlanWake2.exe" "path\to\Control_DX12.exe"` also checks the add-ons against those games' own files. Any of them is enough. For Control Resonant and Alan Wake 2 it checks that the signatures resolve. For Control it loads the game's `rl` and renderer DLLs, without starting the game, and asks the game's own getter whether the pool is at the floor.
+- `build.bat test "path\to\CONTROLResonant.exe" "path\to\AlanWake2.exe" "path\to\Control_DX12.exe"` also checks the add-ons against those games' own files. Any of them is enough. For Control Resonant and Alan Wake 2 it checks that the signatures resolve and that the stats fields are found. For Control it loads the game's `rl` and renderer DLLs, without starting the game, and asks the game's own getter whether the pool is at the floor.
 
 The menu panel is drawn through the ImGui function table that ReShade gives add-ons, so no ImGui code is compiled in. The two headers that takes are in `third_party`.
 

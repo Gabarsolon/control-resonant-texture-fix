@@ -83,17 +83,21 @@ int wmain(int argc, wchar_t **argv)
 
 namespace
 {
-// Addresses found by hand in the builds the add-on was developed against. If the executable is one of
-// them, the result has to match exactly.
+// Addresses and stats offsets found by hand (disassembly) in the builds the add-on was developed against.
+// If the executable is one of them, the result has to match exactly.
 struct KnownBuild
 {
     unsigned version[4];
     uint32_t heap_ptr, mgr_ptr, bias_limit, high, low, rate;
+    uint32_t heap_bytes, tiles, left_lo, left_hi;
 };
 #if defined(CRSF_GAME_AW2)
-constexpr KnownBuild kKnown[] = {{{0, 559, 302, 8}, 0x3A34698, 0x397FEA8, 0x3867D50, 0x3867C78, 0x3867C98, 0x3867CD8}};
+constexpr KnownBuild kKnown[] = {
+    {{0, 559, 302, 8}, 0x3A34698, 0x397FEA8, 0x3867D50, 0x3867C78, 0x3867C98, 0x3867CD8, 0x210, 0x170, 0x1D8, 0x1E0}};
 #else
-constexpr KnownBuild kKnown[] = {{{0, 563, 737, 9}, 0x5C36B48, 0x5D2B470, 0x5D2B688, 0x5D2B508, 0x5D2B530, 0x5D2B5A0}};
+constexpr KnownBuild kKnown[] = {
+    {{0, 563, 737, 9}, 0x5C36B48, 0x5D2B470, 0x5D2B688, 0x5D2B508, 0x5D2B530, 0x5D2B5A0, 0x1E0, 0x140, 0x1A8, 0x1B0},
+    {{0, 564, 208, 5}, 0x5D07328, 0x5E00C70, 0x5E00E18, 0x5E00DC8, 0x5E00DF0, 0x5E00E88, 0x218, 0x140, 0x1E0, 0x1E8}};
 #endif
 } // namespace
 
@@ -119,6 +123,12 @@ int wmain(int argc, wchar_t **argv)
     std::printf("%s heap_ptr=+%X mgr_ptr=+%X bias_limit=+%X high=+%X low=+%X rate=+%X\n", ok ? "OK  " : "FAIL",
                 rva(t.heap_ptr), rva(t.mgr_ptr), rva(t.bias_limit), rva(t.high_threshold), rva(t.low_threshold),
                 rva(t.bias_rate));
+    const StatsLayout &st = t.stats;
+    const bool stats_ok = st.used_known && st.left_known;
+    std::printf("%s stats: heap_bytes=+%X tiles=+%X (%s) left=+%X/+%X (%s)\n", stats_ok ? "OK  " : "FAIL", st.heap_bytes,
+                st.tiles, st.used_known ? "found" : "NOT FOUND", st.left_lo, st.left_hi,
+                st.left_known ? "found" : "NOT FOUND");
+    ok = ok && stats_ok;
 
     unsigned version[4] = {};
     exe_version(base, version);
@@ -130,8 +140,9 @@ int wmain(int argc, wchar_t **argv)
         known = true;
         const bool same = rva(t.heap_ptr) == k.heap_ptr && rva(t.mgr_ptr) == k.mgr_ptr &&
                           rva(t.bias_limit) == k.bias_limit && rva(t.high_threshold) == k.high &&
-                          rva(t.low_threshold) == k.low && rva(t.bias_rate) == k.rate;
-        std::printf("%s the addresses found by hand in this build\n", same ? "OK   matches" : "FAIL differs from");
+                          rva(t.low_threshold) == k.low && rva(t.bias_rate) == k.rate && st.heap_bytes == k.heap_bytes &&
+                          st.tiles == k.tiles && st.left_lo == k.left_lo && st.left_hi == k.left_hi;
+        std::printf("%s the addresses and offsets found by hand in this build\n", same ? "OK   matches" : "FAIL differs from");
         ok = ok && same;
     }
     if (!known)
